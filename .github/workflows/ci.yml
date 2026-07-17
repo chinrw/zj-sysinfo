@@ -8,7 +8,7 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1
@@ -18,7 +18,7 @@ jobs:
         run: cargo test --locked
       - name: Build wasm plugin
         run: cargo build --release --locked --target wasm32-wasip1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zj-sysinfo.wasm
           path: target/wasm32-wasip1/release/zj-sysinfo.wasm
