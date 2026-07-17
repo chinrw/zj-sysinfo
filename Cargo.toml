@@ -1,0 +1,16 @@
+[package]
+name = "zj-sysinfo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zellij-tile = "0.44.3"
+
+[[bin]]
+name = "zj-sysinfo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
