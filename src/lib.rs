@@ -62,13 +62,22 @@ pub fn macos_default_iface(route: &str) -> Option<String> {
     })
 }
 
+/// netstat renders interface names as `%-10.10s`, so anything longer arrives
+/// truncated while `route` reports it in full.
+const NETSTAT_NAME_WIDTH: usize = 10;
+
+/// Whether a netstat row belongs to `iface`, allowing for that truncation.
+fn name_matches(row_name: &str, iface: &str) -> bool {
+    row_name == iface || iface.get(..NETSTAT_NAME_WIDTH) == Some(row_name)
+}
+
 /// (ibytes, obytes) for `iface` from macOS `netstat -ibn` output.
 pub fn macos_iface_bytes(netstat: &str, iface: &str) -> Option<(u64, u64)> {
     netstat.lines().find_map(|line| {
         let fields: Vec<&str> = line.split_whitespace().collect();
         let raw_name = *fields.first()?;
         let name = raw_name.strip_suffix('*').unwrap_or(raw_name);
-        if name != iface || !fields.get(2)?.starts_with("<Link#") {
+        if !name_matches(name, iface) || !fields.get(2)?.starts_with("<Link#") {
             return None;
         }
         let ibytes = fields.get(fields.len().checked_sub(5)?)?.parse().ok()?;
@@ -268,6 +277,19 @@ utun1      1380  fe80::3834: fe80:13::3834:bfc        0     -          0     570
         assert_eq!(macos_iface_bytes(MACOS_NETSTAT, "gif0"), Some((0, 0)));
         assert_eq!(macos_iface_bytes(MACOS_NETSTAT, "eth9"), None);
         assert_eq!(macos_iface_bytes("", "en0"), None);
+    }
+
+    #[test]
+    fn macos_iface_bytes_matches_names_netstat_truncated_to_ten_chars() {
+        // `route` reports the full name, netstat prints `%-10.10s`.
+        const LONG: &str = "\
+Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+bridge1234 1500  <Link#20>   12:b9:24:5c:29:6c      7     0        700       9     0        900     0";
+        assert_eq!(macos_iface_bytes(LONG, "bridge12345"), Some((700, 900)));
+        assert_eq!(macos_iface_bytes(LONG, "bridge1234"), Some((700, 900)));
+        // A shorter name must not match a longer row by prefix.
+        assert_eq!(macos_iface_bytes(LONG, "bridge"), None);
+        assert_eq!(macos_iface_bytes(MACOS_NETSTAT, "en"), None);
     }
 
     #[test]

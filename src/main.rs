@@ -12,6 +12,7 @@ const INTERVAL_SECS: f64 = 2.0;
 const MACOS_PROBE: &str = "/usr/sbin/sysctl -n vm.loadavg; echo '@@'; /sbin/route -n get default 2>/dev/null; echo '@@'; /usr/sbin/netstat -ibn 2>/dev/null";
 const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
 const PROBE_CONTEXT_VALUE: &str = "macos-sysinfo";
+const PROBE_CONTEXT_GENERATION_KEY: &str = "generation";
 /// Ticks to wait before abandoning an outstanding probe, and the ceiling that
 /// wait backs off to. A dropped result must not freeze the widgets forever,
 /// but a genuinely hung probe must not get a replacement every few seconds
@@ -35,6 +36,9 @@ struct State {
     probe_in_flight: bool,
     missed_ticks: u32,
     abandon_after: u32,
+    /// Stamped into each probe's context so a result we already gave up on
+    /// can be told apart from the one currently in flight.
+    generation: u64,
     /// (interface name, sample time, rx bytes, tx bytes) of the previous tick.
     prev: Option<(String, Instant, u64, u64)>,
 }
@@ -47,6 +51,7 @@ impl Default for State {
             probe_in_flight: false,
             missed_ticks: 0,
             abandon_after: MISSED_PROBE_TICKS,
+            generation: 0,
             prev: None,
         }
     }
@@ -91,7 +96,7 @@ impl ZellijPlugin for State {
                 set_timeout(INTERVAL_SECS);
             },
             Event::RunCommandResult(_, stdout, _, context) if is_macos_probe_result(&context) => {
-                self.handle_macos_probe(&stdout);
+                self.handle_macos_probe(&stdout, &context);
             },
             _ => {},
         }
@@ -153,18 +158,41 @@ impl State {
                 return;
             }
             self.abandon_after = (self.abandon_after * 2).min(MISSED_PROBE_TICKS_MAX);
+            // Stop presenting the abandoned probe's readings as current.
+            self.report_unavailable();
         }
         self.missed_ticks = 0;
         self.probe_in_flight = true;
+        self.generation = self.generation.wrapping_add(1);
         let mut context = BTreeMap::new();
         context.insert(
             PROBE_CONTEXT_KEY.to_string(),
             PROBE_CONTEXT_VALUE.to_string(),
         );
+        context.insert(
+            PROBE_CONTEXT_GENERATION_KEY.to_string(),
+            self.generation.to_string(),
+        );
         run_command(&["/bin/sh", "-c", MACOS_PROBE], context);
     }
 
-    fn handle_macos_probe(&mut self, stdout: &[u8]) {
+    fn report_unavailable(&mut self) {
+        self.prev = None;
+        push_widget("pipe_netspeed", "-");
+        push_widget("pipe_uptime", "-");
+    }
+
+    fn handle_macos_probe(&mut self, stdout: &[u8], context: &BTreeMap<String, String>) {
+        // A result for a probe we already abandoned would clear the flag for
+        // the replacement still in flight, defeating the backoff, and would
+        // feed an out-of-order sample into `prev`.
+        let generation = context
+            .get(PROBE_CONTEXT_GENERATION_KEY)
+            .and_then(|g| g.parse::<u64>().ok());
+        if generation != Some(self.generation) {
+            return;
+        }
+
         self.probe_in_flight = false;
         self.missed_ticks = 0;
         self.abandon_after = MISSED_PROBE_TICKS;

@@ -29,7 +29,12 @@ The host is detected at runtime (the wasm artifact is platform-neutral).
 | | Source | Processes spawned |
 |---|---|---|
 | Linux | `/proc/net/route`, `/proc/net/dev`, `/proc/loadavg` via WASI | none |
-| macOS | `sysctl` + `route` + `netstat` via one `/bin/sh` per tick | 1 per session per 2 s |
+| macOS | `sysctl` + `route` + `netstat` under one `/bin/sh` | 4 per session per 2 s |
+
+The macOS tick is a single `run_command`, but that is four processes: the
+shell plus the three tools. A probe that stops answering is abandoned with
+doubling backoff (up to ~8 min between attempts) and both widgets fall back
+to `-`, so a wedged host slows down rather than accumulating processes.
 
 macOS has no `/proc` and exposes counters only through syscalls, so a pure
 WASI read is impossible there. The fallback is still far below the per-tab
@@ -81,9 +86,11 @@ them apart at build time). **A background plugin has no pane, so zellij
 never shows it a permission prompt** — seed the permission cache before
 the first session start, or both widgets stay silently blank.
 
-The cache lives at `~/.cache/zellij/permissions.kdl` on Linux and
-`~/Library/Caches/org.Zellij-Contributors.Zellij/permissions.kdl` on
-macOS (zellij resolves it via `ProjectDirs`, which is not XDG on darwin):
+zellij resolves the cache through `ProjectDirs`, so it is
+`$XDG_CACHE_HOME/zellij/permissions.kdl` on Linux (defaulting to
+`~/.cache/zellij`) and
+`~/Library/Caches/org.Zellij-Contributors.Zellij/permissions.kdl` on macOS
+— darwin does not use XDG:
 
 ```kdl
 "/home/<you>/.config/zellij-plugins/zj-sysinfo.wasm" {
