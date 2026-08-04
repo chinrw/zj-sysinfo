@@ -6,19 +6,31 @@ on:
 
 jobs:
   test-and-build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1
       - name: Install native test deps
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      # --lib only: the bin target links zellij-utils -> isahc -> curl-sys,
+      # which finds no system libcurl on the macOS runners. All parsers under
+      # test live in the lib target, so nothing is lost; `cargo check --bins`
+      # below still gates the plugin wiring on both platforms.
       - name: Native tests
-        run: cargo test --locked
+        run: cargo test --locked --lib
+      - name: Type-check plugin binary
+        run: cargo check --locked --bins
       - name: Build wasm plugin
         run: cargo build --release --locked --target wasm32-wasip1
       - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
         with:
           name: zj-sysinfo.wasm
           path: target/wasm32-wasip1/release/zj-sysinfo.wasm

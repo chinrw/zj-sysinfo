@@ -4,15 +4,52 @@ use std::time::Instant;
 
 use zellij_tile::prelude::*;
 
-use zj_sysinfo::{default_iface, fallback_iface, format_speed, iface_bytes, loadavg, rate};
+use zj_sysinfo::{
+    default_iface, fallback_iface, format_speed, iface_bytes, loadavg, parse_macos_probe, rate,
+};
 
 const INTERVAL_SECS: f64 = 2.0;
+const MACOS_PROBE: &str = "/usr/sbin/sysctl -n vm.loadavg; echo '@@'; /sbin/route -n get default 2>/dev/null; echo '@@'; /usr/sbin/netstat -ibn 2>/dev/null";
+const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
+const PROBE_CONTEXT_VALUE: &str = "macos-sysinfo";
+/// Ticks to wait before abandoning an outstanding probe, and the ceiling that
+/// wait backs off to. A dropped result must not freeze the widgets forever,
+/// but a genuinely hung probe must not get a replacement every few seconds
+/// either -- doubling keeps the leak rate decaying instead of linear.
+const MISSED_PROBE_TICKS: u32 = 3;
+const MISSED_PROBE_TICKS_MAX: u32 = 240;
 
-#[derive(Default)]
+/// Only Linux is ever latched. Detect re-probes /host/proc every tick, so a
+/// read that loses a startup race with change_host_folder can't strand a
+/// Linux host on the fork-per-tick command path.
+#[derive(Clone, Copy, Default)]
+enum HostMode {
+    #[default]
+    Detect,
+    Linux,
+}
+
 struct State {
     granted: bool,
+    host_mode: HostMode,
+    probe_in_flight: bool,
+    missed_ticks: u32,
+    abandon_after: u32,
     /// (interface name, sample time, rx bytes, tx bytes) of the previous tick.
     prev: Option<(String, Instant, u64, u64)>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            granted: false,
+            host_mode: HostMode::default(),
+            probe_in_flight: false,
+            missed_ticks: 0,
+            abandon_after: MISSED_PROBE_TICKS,
+            prev: None,
+        }
+    }
 }
 
 register_plugin!(State);
@@ -22,8 +59,13 @@ impl ZellijPlugin for State {
         request_permission(&[
             PermissionType::FullHdAccess,
             PermissionType::MessageAndLaunchOtherPlugins,
+            PermissionType::RunCommands,
         ]);
-        subscribe(&[EventType::Timer, EventType::PermissionRequestResult]);
+        subscribe(&[
+            EventType::Timer,
+            EventType::PermissionRequestResult,
+            EventType::RunCommandResult,
+        ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -41,11 +83,15 @@ impl ZellijPlugin for State {
                 request_permission(&[
                     PermissionType::FullHdAccess,
                     PermissionType::MessageAndLaunchOtherPlugins,
+                    PermissionType::RunCommands,
                 ]);
             },
             Event::Timer(_) => {
                 self.tick();
                 set_timeout(INTERVAL_SECS);
+            },
+            Event::RunCommandResult(_, stdout, _, context) if is_macos_probe_result(&context) => {
+                self.handle_macos_probe(&stdout);
             },
             _ => {},
         }
@@ -55,12 +101,29 @@ impl ZellijPlugin for State {
 
 impl State {
     fn tick(&mut self) {
+        // This host-mounted proc file exists on Linux and not macOS.
+        if matches!(self.host_mode, HostMode::Detect)
+            && std::fs::read_to_string("/host/proc/net/route").is_ok()
+        {
+            self.host_mode = HostMode::Linux;
+        }
+        match self.host_mode {
+            HostMode::Linux => self.tick_linux(),
+            HostMode::Detect => self.start_macos_probe(),
+        }
+    }
+
+    fn tick_linux(&mut self) {
         push_widget("pipe_netspeed", &self.netspeed_text());
         push_widget("pipe_uptime", &loadavg_text());
     }
 
     fn netspeed_text(&mut self) -> String {
-        let Some((iface, (rx, tx))) = read_counters() else {
+        self.netspeed_text_from(read_counters())
+    }
+
+    fn netspeed_text_from(&mut self, counters: Option<(String, (u64, u64))>) -> String {
+        let Some((iface, (rx, tx))) = counters else {
             self.prev = None;
             return "-".to_string();
         };
@@ -82,6 +145,46 @@ impl State {
         self.prev = Some((iface, now, rx, tx));
         text
     }
+
+    fn start_macos_probe(&mut self) {
+        if self.probe_in_flight {
+            self.missed_ticks += 1;
+            if self.missed_ticks < self.abandon_after {
+                return;
+            }
+            self.abandon_after = (self.abandon_after * 2).min(MISSED_PROBE_TICKS_MAX);
+        }
+        self.missed_ticks = 0;
+        self.probe_in_flight = true;
+        let mut context = BTreeMap::new();
+        context.insert(
+            PROBE_CONTEXT_KEY.to_string(),
+            PROBE_CONTEXT_VALUE.to_string(),
+        );
+        run_command(&["/bin/sh", "-c", MACOS_PROBE], context);
+    }
+
+    fn handle_macos_probe(&mut self, stdout: &[u8]) {
+        self.probe_in_flight = false;
+        self.missed_ticks = 0;
+        self.abandon_after = MISSED_PROBE_TICKS;
+        let sample = std::str::from_utf8(stdout).ok().and_then(parse_macos_probe);
+        let (counters, loadavg) = match sample {
+            Some(sample) => (sample.counters, sample.loadavg),
+            None => (None, None),
+        };
+
+        let netspeed = self.netspeed_text_from(counters);
+        let loadavg = loadavg
+            .map(|(one, five)| format!("{one} {five}"))
+            .unwrap_or_else(|| "-".to_string());
+        push_widget("pipe_netspeed", &netspeed);
+        push_widget("pipe_uptime", &loadavg);
+    }
+}
+
+fn is_macos_probe_result(context: &BTreeMap<String, String>) -> bool {
+    context.get(PROBE_CONTEXT_KEY).map(String::as_str) == Some(PROBE_CONTEXT_VALUE)
 }
 
 /// (interface name, (rx bytes, tx bytes)) of the default-route interface,
