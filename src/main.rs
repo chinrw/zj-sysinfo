@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use zellij_tile::prelude::*;
 
 use zj_sysinfo::{
     default_iface, fallback_iface, format_speed, iface_bytes, loadavg, parse_macos_probe, rate,
+    ClientAction, SessionTicker, TimerAction,
 };
 
-const INTERVAL_SECS: f64 = 2.0;
+const INTERVAL: Duration = Duration::from_secs(2);
 const MACOS_PROBE: &str = "/usr/sbin/sysctl -n vm.loadavg; echo '@@'; /sbin/route -n get default 2>/dev/null; echo '@@'; /usr/sbin/netstat -ibn 2>/dev/null";
 const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
 const PROBE_CONTEXT_VALUE: &str = "macos-sysinfo";
@@ -32,6 +33,9 @@ enum HostMode {
 
 struct State {
     granted: bool,
+    client_id: Option<u16>,
+    ticker: SessionTicker,
+    is_publisher: bool,
     host_mode: HostMode,
     probe_in_flight: bool,
     missed_ticks: u32,
@@ -47,6 +51,9 @@ impl Default for State {
     fn default() -> Self {
         Self {
             granted: false,
+            client_id: None,
+            ticker: SessionTicker::default(),
+            is_publisher: false,
             host_mode: HostMode::default(),
             probe_in_flight: false,
             missed_ticks: 0,
@@ -61,13 +68,16 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
+        self.client_id = Some(get_plugin_ids().client_id);
         request_permission(&[
+            PermissionType::ReadApplicationState,
             PermissionType::FullHdAccess,
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::RunCommands,
         ]);
         subscribe(&[
             EventType::Timer,
+            EventType::ListClients,
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
         ]);
@@ -78,33 +88,78 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(PermissionStatus::Granted) if !self.granted => {
                 self.granted = true;
                 change_host_folder(PathBuf::from("/"));
-                set_timeout(0.0); // first tick immediately
-            },
+                if let Some(delay) = self.ticker.start(Instant::now()) {
+                    schedule_timer(delay);
+                }
+            }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 eprintln!("zj-sysinfo: permission denied; widgets will stay empty");
                 // pipe_message_to_plugin (used by push_widget) needs
                 // MessageAndLaunchOtherPlugins, which was just denied, so we
                 // can't report through the widgets here. Retry once instead.
                 request_permission(&[
+                    PermissionType::ReadApplicationState,
                     PermissionType::FullHdAccess,
                     PermissionType::MessageAndLaunchOtherPlugins,
                     PermissionType::RunCommands,
                 ]);
-            },
-            Event::Timer(_) => {
-                self.tick();
-                set_timeout(INTERVAL_SECS);
-            },
-            Event::RunCommandResult(_, stdout, _, context) if is_macos_probe_result(&context) => {
+            }
+            Event::Timer(_) if self.granted => {
+                if self.ticker.on_timer(Instant::now(), INTERVAL) == TimerAction::QueryClients {
+                    list_clients();
+                }
+            }
+            Event::ListClients(clients) => {
+                let Some(client_id) = self.client_id else {
+                    return false;
+                };
+                let action = self.ticker.on_clients(
+                    Instant::now(),
+                    client_id,
+                    clients.into_iter().map(|client| client.client_id),
+                );
+                self.handle_client_action(action);
+            }
+            Event::RunCommandResult(_, stdout, _, context)
+                if self.is_publisher && is_macos_probe_result(&context) =>
+            {
                 self.handle_macos_probe(&stdout, &context);
-            },
-            _ => {},
+            }
+            _ => {}
         }
         false // background plugin: nothing to render
     }
 }
 
 impl State {
+    fn handle_client_action(&mut self, action: ClientAction) {
+        match action {
+            ClientAction::Ignore => {}
+            ClientAction::Stop => self.deactivate_publisher(),
+            ClientAction::Schedule(delay) => {
+                self.deactivate_publisher();
+                schedule_timer(delay);
+            }
+            ClientAction::PublishAndSchedule(delay) => {
+                self.is_publisher = true;
+                schedule_timer(delay);
+                self.tick();
+            }
+        }
+    }
+
+    fn deactivate_publisher(&mut self) {
+        if !self.is_publisher && !self.probe_in_flight && self.prev.is_none() {
+            return;
+        }
+        self.is_publisher = false;
+        self.probe_in_flight = false;
+        self.missed_ticks = 0;
+        self.abandon_after = MISSED_PROBE_TICKS;
+        self.generation = self.generation.wrapping_add(1);
+        self.prev = None;
+    }
+
     fn tick(&mut self) {
         // This host-mounted proc file exists on Linux and not macOS.
         if matches!(self.host_mode, HostMode::Detect)
@@ -144,7 +199,7 @@ impl State {
                     format_speed(rate(*prev_rx, rx, elapsed)),
                     format_speed(rate(*prev_tx, tx, elapsed)),
                 )
-            },
+            }
             _ => "-".to_string(),
         };
         self.prev = Some((iface, now, rx, tx));
@@ -209,6 +264,10 @@ impl State {
         push_widget("pipe_netspeed", &netspeed);
         push_widget("pipe_uptime", &loadavg);
     }
+}
+
+fn schedule_timer(delay: Duration) {
+    set_timeout(delay.as_secs_f64());
 }
 
 fn is_macos_probe_result(context: &BTreeMap<String, String>) -> bool {

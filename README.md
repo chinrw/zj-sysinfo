@@ -11,9 +11,11 @@ that fork `bash -c` pipelines every 1–2 seconds **per tab**. On a busy
 session that is hundreds of execs per second; under memory pressure those
 fire-and-forget children can pile up (on the author's machine: ~2,200 live
 bash processes and a 10-minute OOM storm). zj-sysinfo replaces all of it
-with one plugin instance per session that reads `/proc` directly through
+with one active sampler per session that reads `/proc` directly through
 the WASI host filesystem and broadcasts ready-made strings to every
-zjstatus instance.
+zjstatus instance. Zellij creates a plugin copy for each client;
+zj-sysinfo elects one connected copy as the publisher and leaves the
+others idle.
 
 - `pipe_netspeed` — `D: 1.2 MB/s U: 340 KB/s` (default-route interface,
   auto-detected, with fallback to the first non-loopback interface with
@@ -79,7 +81,8 @@ pipe_uptime_rendermode    "static"
 
 ## Permissions (important)
 
-The plugin needs `FullHdAccess` (remount `/host` at `/`),
+The plugin needs `ReadApplicationState` (elect one publisher from the
+connected clients), `FullHdAccess` (remount `/host` at `/`),
 `MessageAndLaunchOtherPlugins` (pipe to zjstatus) and `RunCommands` (the
 macOS probe; requested on every platform because the artifact cannot tell
 them apart at build time). **A background plugin has no pane, so zellij
@@ -94,6 +97,7 @@ zellij resolves the cache through `ProjectDirs`, so it is
 
 ```kdl
 "/home/<you>/.config/zellij-plugins/zj-sysinfo.wasm" {
+    ReadApplicationState
     FullHdAccess
     MessageAndLaunchOtherPlugins
     RunCommands

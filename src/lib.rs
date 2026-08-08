@@ -1,3 +1,98 @@
+use std::time::{Duration, Instant};
+
+// add_client() starts loading plugin copies before it records the client as
+// connected. One miss avoids retiring a new copy during that window.
+const MISSING_CLIENT_POLLS_BEFORE_STOP: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerAction {
+    Ignore,
+    QueryClients,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAction {
+    Ignore,
+    Stop,
+    Schedule(Duration),
+    PublishAndSchedule(Duration),
+}
+
+#[derive(Debug, Default)]
+pub struct SessionTicker {
+    next_due: Option<Instant>,
+    timer_armed: bool,
+    client_query_in_flight: bool,
+    missing_client_polls: u8,
+}
+
+impl SessionTicker {
+    pub fn start(&mut self, now: Instant) -> Option<Duration> {
+        if self.timer_armed || self.client_query_in_flight {
+            return None;
+        }
+        self.next_due = Some(now);
+        self.timer_armed = true;
+        Some(Duration::ZERO)
+    }
+
+    pub fn on_timer(&mut self, now: Instant, interval: Duration) -> TimerAction {
+        if !self.timer_armed || self.client_query_in_flight {
+            return TimerAction::Ignore;
+        }
+        let due = self.next_due.unwrap_or(now);
+        if now < due {
+            return TimerAction::Ignore;
+        }
+        self.timer_armed = false;
+        self.next_due = Some(now + interval);
+        self.client_query_in_flight = true;
+        TimerAction::QueryClients
+    }
+
+    pub fn on_clients<I>(
+        &mut self,
+        now: Instant,
+        own_client_id: u16,
+        connected_client_ids: I,
+    ) -> ClientAction
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        if !self.client_query_in_flight {
+            return ClientAction::Ignore;
+        }
+        self.client_query_in_flight = false;
+        let delay = self
+            .next_due
+            .map(|due| due.saturating_duration_since(now))
+            .unwrap_or_default();
+        let mut own_client_is_connected = false;
+        let mut publisher = None;
+        for client_id in connected_client_ids {
+            own_client_is_connected |= client_id == own_client_id;
+            publisher = Some(publisher.map_or(client_id, |current: u16| current.min(client_id)));
+        }
+        if !own_client_is_connected {
+            self.missing_client_polls = self.missing_client_polls.saturating_add(1);
+            if self.missing_client_polls >= MISSING_CLIENT_POLLS_BEFORE_STOP {
+                self.next_due = None;
+                return ClientAction::Stop;
+            }
+            self.timer_armed = true;
+            return ClientAction::Schedule(delay);
+        }
+
+        self.missing_client_polls = 0;
+        self.timer_armed = true;
+        if publisher == Some(own_client_id) {
+            ClientAction::PublishAndSchedule(delay)
+        } else {
+            ClientAction::Schedule(delay)
+        }
+    }
+}
+
 /// First route whose Destination is 00000000 (the default route).
 pub fn default_iface(route: &str) -> Option<String> {
     route
@@ -161,6 +256,98 @@ pub fn format_speed(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    const TICK: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn client_scoped_instances_choose_one_session_publisher() {
+        let now = Instant::now();
+        let mut first = SessionTicker::default();
+        let mut second = SessionTicker::default();
+
+        assert_eq!(first.start(now), Some(Duration::ZERO));
+        assert_eq!(second.start(now), Some(Duration::ZERO));
+        assert_eq!(first.on_timer(now, TICK), TimerAction::QueryClients);
+        assert_eq!(second.on_timer(now, TICK), TimerAction::QueryClients);
+
+        let actions = [
+            first.on_clients(now, 1, [1, 2]),
+            second.on_clients(now, 2, [1, 2]),
+        ];
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ClientAction::PublishAndSchedule(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_timer_events_do_not_fork_the_tick_loop() {
+        let now = Instant::now();
+        let mut ticker = SessionTicker::default();
+
+        assert_eq!(ticker.start(now), Some(Duration::ZERO));
+        assert_eq!(ticker.on_timer(now, TICK), TimerAction::QueryClients);
+        assert_eq!(ticker.on_timer(now, TICK), TimerAction::Ignore);
+        assert_eq!(
+            ticker.on_clients(now, 1, [1]),
+            ClientAction::PublishAndSchedule(TICK)
+        );
+        assert_eq!(
+            ticker.on_timer(now + Duration::from_secs(1), TICK),
+            TimerAction::Ignore
+        );
+        assert_eq!(ticker.on_timer(now + TICK, TICK), TimerAction::QueryClients);
+    }
+
+    #[test]
+    fn disconnected_instance_stops_after_a_transient_miss() {
+        let now = Instant::now();
+        let mut ticker = SessionTicker::default();
+
+        assert_eq!(ticker.start(now), Some(Duration::ZERO));
+        assert_eq!(ticker.on_timer(now, TICK), TimerAction::QueryClients);
+        assert_eq!(ticker.on_clients(now, 1, [2]), ClientAction::Schedule(TICK));
+        assert_eq!(ticker.on_timer(now + TICK, TICK), TimerAction::QueryClients);
+        assert_eq!(ticker.on_clients(now + TICK, 1, [2]), ClientAction::Stop);
+    }
+
+    #[test]
+    fn connected_follower_takes_over_when_the_publisher_disconnects() {
+        let now = Instant::now();
+        let mut first = SessionTicker::default();
+        let mut second = SessionTicker::default();
+
+        first.start(now);
+        second.start(now);
+        first.on_timer(now, TICK);
+        second.on_timer(now, TICK);
+        assert!(matches!(
+            first.on_clients(now, 1, [1, 2]),
+            ClientAction::PublishAndSchedule(_)
+        ));
+        assert!(matches!(
+            second.on_clients(now, 2, [1, 2]),
+            ClientAction::Schedule(_)
+        ));
+
+        first.on_timer(now + TICK, TICK);
+        second.on_timer(now + TICK, TICK);
+        let actions = [
+            first.on_clients(now + TICK, 1, [2]),
+            second.on_clients(now + TICK, 2, [2]),
+        ];
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, ClientAction::PublishAndSchedule(_)))
+                .count(),
+            1
+        );
+    }
 
     const ROUTE: &str = "\
 Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
@@ -311,7 +498,8 @@ bridge1234 1500  <Link#20>   12:b9:24:5c:29:6c      7     0        700       9  
         assert_eq!(parse_macos_probe(""), None);
         assert_eq!(parse_macos_probe("{ 2.85 3.13 3.64 }\n@@\n"), None);
 
-        let no_route = format!("{{ 2.85 3.13 3.64 }}\n@@\nroute to: default\n@@\n{MACOS_NETSTAT}\n");
+        let no_route =
+            format!("{{ 2.85 3.13 3.64 }}\n@@\nroute to: default\n@@\n{MACOS_NETSTAT}\n");
         assert_eq!(
             parse_macos_probe(&no_route),
             Some(MacosProbe {

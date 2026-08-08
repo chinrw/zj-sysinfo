@@ -7,6 +7,20 @@
 Date: 2026-07-17
 Status: approved
 
+## Lifecycle correction (2026-08-08)
+
+Zellij 0.44.3 stores plugin instances by `(plugin_id, client_id)`. A new
+client receives another copy, while disconnecting a client does not remove
+its copy. The original `1 instance/session` assumption below is therefore
+not the runtime contract.
+
+The plugin now queries connected clients every 2 seconds. The connected
+copy with the lowest client ID is the only sampler and broadcaster;
+connected followers keep polling for handover, and a disconnected copy
+stops its timer after one grace poll. A deadline gate also collapses stale
+timer events that Zellij can deliver after replacing a client copy. This
+requires the additional `ReadApplicationState` permission.
+
 ## Problem
 
 The zjstatus status bar shows net speed and load averages via `command_*`
