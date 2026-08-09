@@ -14,17 +14,25 @@ client receives another copy, while disconnecting a client does not remove
 its copy. The original `1 instance/session` assumption below is therefore
 not the runtime contract.
 
-The connected copy with the lowest client ID is the only sampler and
-broadcaster. Connected followers poll every 2 seconds for handover. A copy
-missing from the pane-derived client snapshot stops sampling immediately
-but keeps retrying at 2, 4, 8, 16, then 30-second intervals; snapshot
-absence is not an authoritative disconnect signal. The next sampling
-deadline is armed only after the current sampling attempt returns, so
-snapshot and synchronous publication latency cannot compress the next
-launch below 2 seconds. Async probe results pass through a separate
-2-second publication gate so variable completion latency cannot bunch
-widget updates. A timer deadline also collapses stale events. This requires
-the additional `ReadApplicationState` permission.
+Only client slot 1 runs the plugin. Zellij allocates the lowest free positive
+client ID, retains the slot's plugin instance after disconnect, and replaces
+that same map entry when ID 1 is reused. All other client-scoped copies stay
+dormant: they request no permissions, subscribe to no events, and arm no
+timers.
+
+Every sample goes through one `SessionBroadcaster`. It retains the latest
+pending values, pushes the two widgets together when due, and records the
+completion time only after the second push. Early async results are delayed
+instead of dropped. Before publishing, the sink takes an atomic lock in the
+plugin's shared `/cache` directory and checks a completion timestamp scoped by
+Zellij PID and plugin ID. This serializes an old slot-1 callback with its
+replacement. A private completion message updates the replacement's local
+deadline early, but the shared lease is authoritative. Timer deadlines collapse
+stale events.
+
+macOS command launches and completions have a separate lifecycle. Command
+context includes both an instance nonce and a generation, so a result from an
+abandoned probe or replaced slot cannot complete the current probe.
 
 ## Problem
 

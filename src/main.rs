@@ -1,19 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zellij_tile::prelude::*;
 
 use zj_sysinfo::{
-    default_iface, fallback_iface, format_speed, iface_bytes, loadavg, parse_macos_probe, rate,
-    ClientAction, SessionTicker, TimerAction,
+    compose_instance_nonce, default_iface, fallback_iface, format_speed, iface_bytes,
+    is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
+    publication_completion_nonce, rate, AsyncProbe, BroadcasterAction, ProbeAction, ProbeToken,
+    SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
+    SystemEpochClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
 
 const INTERVAL: Duration = Duration::from_secs(2);
 const MACOS_PROBE: &str = "/usr/sbin/sysctl -n vm.loadavg; echo '@@'; /sbin/route -n get default 2>/dev/null; echo '@@'; /usr/sbin/netstat -ibn 2>/dev/null";
-const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
-const PROBE_CONTEXT_VALUE: &str = "macos-sysinfo";
-const PROBE_CONTEXT_GENERATION_KEY: &str = "generation";
 /// Ticks to wait before abandoning an outstanding probe, and the ceiling that
 /// wait backs off to. A dropped result must not freeze the widgets forever,
 /// but a genuinely hung probe must not get a replacement every few seconds
@@ -31,34 +31,48 @@ enum HostMode {
     Linux,
 }
 
+#[derive(Default)]
 struct State {
+    runtime: Option<Runtime>,
+}
+
+struct Runtime {
     granted: bool,
-    client_id: Option<u16>,
-    ticker: SessionTicker,
-    is_publisher: bool,
+    plugin_id: u32,
+    instance_nonce: u128,
+    ticker: SampleTicker,
+    broadcaster: SessionBroadcaster<SystemClock, ZellijSink>,
     host_mode: HostMode,
-    probe_in_flight: bool,
-    missed_ticks: u32,
-    abandon_after: u32,
-    /// Stamped into each probe's context so a result we already gave up on
-    /// can be told apart from the one currently in flight.
-    generation: u64,
+    probe: AsyncProbe,
     /// (interface name, sample time, rx bytes, tx bytes) of the previous tick.
     prev: Option<(String, Instant, u64, u64)>,
 }
 
-impl Default for State {
-    fn default() -> Self {
+impl Runtime {
+    fn new(plugin_id: u32, zellij_pid: u32) -> Self {
+        let instance_nonce = instance_nonce(plugin_id, zellij_pid);
         Self {
             granted: false,
-            client_id: None,
-            ticker: SessionTicker::new(INTERVAL),
-            is_publisher: false,
+            plugin_id,
+            instance_nonce,
+            ticker: SampleTicker::new(INTERVAL),
+            broadcaster: SessionBroadcaster::new(
+                INTERVAL,
+                SystemClock,
+                ZellijSink {
+                    plugin_id,
+                    instance_nonce,
+                    lease: SharedPublicationLease::new(
+                        INTERVAL,
+                        PathBuf::from(format!(
+                            "/cache/zj-sysinfo-{zellij_pid}-{plugin_id}.publication"
+                        )),
+                        SystemEpochClock,
+                    ),
+                },
+            ),
             host_mode: HostMode::default(),
-            probe_in_flight: false,
-            missed_ticks: 0,
-            abandon_after: MISSED_PROBE_TICKS,
-            generation: 0,
+            probe: AsyncProbe::new(instance_nonce, MISSED_PROBE_TICKS, MISSED_PROBE_TICKS_MAX),
             prev: None,
         }
     }
@@ -68,22 +82,43 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        self.client_id = Some(get_plugin_ids().client_id);
+        let ids = get_plugin_ids();
+        // Zellij 0.44.3 starts client IDs at 1 and retains this plugin slot
+        // after disconnect. Reused ID 1 replaces the slot instead of adding a
+        // second active copy, so every other client-scoped copy stays dormant.
+        if !is_active_client(ids.client_id) {
+            return;
+        }
+        self.runtime = Some(Runtime::new(ids.plugin_id, ids.zellij_pid));
         request_permission(&[
-            PermissionType::ReadApplicationState,
             PermissionType::FullHdAccess,
             PermissionType::MessageAndLaunchOtherPlugins,
             PermissionType::RunCommands,
         ]);
         subscribe(&[
             EventType::Timer,
-            EventType::ListClients,
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
         ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.update(event);
+        }
+        false // background plugin: nothing to render
+    }
+
+    fn pipe(&mut self, message: PipeMessage) -> bool {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.handle_pipe(message);
+        }
+        false
+    }
+}
+
+impl Runtime {
+    fn update(&mut self, event: Event) {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) if !self.granted => {
                 self.granted = true;
@@ -98,66 +133,47 @@ impl ZellijPlugin for State {
                 // MessageAndLaunchOtherPlugins, which was just denied, so we
                 // can't report through the widgets here. Retry once instead.
                 request_permission(&[
-                    PermissionType::ReadApplicationState,
                     PermissionType::FullHdAccess,
                     PermissionType::MessageAndLaunchOtherPlugins,
                     PermissionType::RunCommands,
                 ]);
             }
             Event::Timer(_) if self.granted => {
-                if self.ticker.on_timer(Instant::now()) == TimerAction::QueryClients {
-                    list_clients();
+                let broadcast_action = self.broadcaster.on_timer();
+                self.handle_broadcaster_action(broadcast_action);
+                if self.ticker.on_timer(Instant::now()) == TimerAction::RunCycle {
+                    self.tick();
+                    let delay = self.ticker.on_cycle_completed(Instant::now());
+                    schedule_timer(delay);
                 }
             }
-            Event::ListClients(clients) => {
-                let Some(client_id) = self.client_id else {
-                    return false;
-                };
-                let action = self.ticker.on_clients(
-                    Instant::now(),
-                    client_id,
-                    clients.into_iter().map(|client| client.client_id),
-                );
-                self.handle_client_action(action);
-            }
             Event::RunCommandResult(_, stdout, _, context)
-                if self.is_publisher && is_macos_probe_result(&context) =>
+                if probe_token_from_context(&context).is_some() =>
             {
                 self.handle_macos_probe(&stdout, &context);
             }
             _ => {}
         }
-        false // background plugin: nothing to render
-    }
-}
-
-impl State {
-    fn handle_client_action(&mut self, action: ClientAction) {
-        match action {
-            ClientAction::Ignore => {}
-            ClientAction::Schedule(delay) => {
-                self.deactivate_publisher();
-                schedule_timer(delay);
-            }
-            ClientAction::Sample => {
-                self.is_publisher = true;
-                self.tick();
-                let delay = self.ticker.on_sample_cycle_completed(Instant::now());
-                schedule_timer(delay);
-            }
-        }
     }
 
-    fn deactivate_publisher(&mut self) {
-        if !self.is_publisher && !self.probe_in_flight && self.prev.is_none() {
+    fn handle_pipe(&mut self, message: PipeMessage) {
+        let source_plugin_id = match message.source {
+            PipeSource::Plugin(plugin_id) => Some(plugin_id),
+            _ => None,
+        };
+        let Some(nonce) = publication_completion_nonce(
+            self.plugin_id,
+            source_plugin_id,
+            message.is_private,
+            &message.name,
+            message.payload.as_deref(),
+        ) else {
             return;
+        };
+        if nonce != self.instance_nonce {
+            let action = self.broadcaster.observe_external_publication();
+            self.handle_broadcaster_action(action);
         }
-        self.is_publisher = false;
-        self.probe_in_flight = false;
-        self.missed_ticks = 0;
-        self.abandon_after = MISSED_PROBE_TICKS;
-        self.generation = self.generation.wrapping_add(1);
-        self.prev = None;
     }
 
     fn tick(&mut self) {
@@ -166,19 +182,17 @@ impl State {
             && std::fs::read_to_string("/host/proc/net/route").is_ok()
         {
             self.host_mode = HostMode::Linux;
+            self.probe.cancel();
         }
         match self.host_mode {
             HostMode::Linux => self.tick_linux(),
-            HostMode::Detect => self.start_macos_probe(),
+            HostMode::Detect => self.tick_macos(),
         }
     }
 
     fn tick_linux(&mut self) {
-        if !self.ticker.allow_publication(Instant::now()) {
-            return;
-        }
-        push_widget("pipe_netspeed", &self.netspeed_text());
-        push_widget("pipe_uptime", &loadavg_text());
+        let values = WidgetValues::new(self.netspeed_text(), loadavg_text());
+        self.submit(values);
     }
 
     fn netspeed_text(&mut self) -> String {
@@ -209,55 +223,27 @@ impl State {
         text
     }
 
-    fn start_macos_probe(&mut self) {
-        if self.probe_in_flight {
-            self.missed_ticks += 1;
-            if self.missed_ticks < self.abandon_after {
-                return;
+    fn tick_macos(&mut self) {
+        match self.probe.on_cycle() {
+            ProbeAction::Start(token) => self.launch_macos_probe(token),
+            ProbeAction::Wait => {}
+            ProbeAction::Restart(token) => {
+                self.prev = None;
+                self.submit(WidgetValues::new("-", "-"));
+                self.launch_macos_probe(token);
             }
-            self.abandon_after = (self.abandon_after * 2).min(MISSED_PROBE_TICKS_MAX);
-            // Stop presenting the abandoned probe's readings as current.
-            self.report_unavailable();
         }
-        self.missed_ticks = 0;
-        self.probe_in_flight = true;
-        self.generation = self.generation.wrapping_add(1);
-        let mut context = BTreeMap::new();
-        context.insert(
-            PROBE_CONTEXT_KEY.to_string(),
-            PROBE_CONTEXT_VALUE.to_string(),
-        );
-        context.insert(
-            PROBE_CONTEXT_GENERATION_KEY.to_string(),
-            self.generation.to_string(),
-        );
-        run_command(&["/bin/sh", "-c", MACOS_PROBE], context);
     }
 
-    fn report_unavailable(&mut self) {
-        self.prev = None;
-        if !self.ticker.allow_publication(Instant::now()) {
-            return;
-        }
-        push_widget("pipe_netspeed", "-");
-        push_widget("pipe_uptime", "-");
+    fn launch_macos_probe(&self, token: ProbeToken) {
+        run_command(&["/bin/sh", "-c", MACOS_PROBE], probe_context(token));
     }
 
     fn handle_macos_probe(&mut self, stdout: &[u8], context: &BTreeMap<String, String>) {
-        // A result for a probe we already abandoned would clear the flag for
-        // the replacement still in flight, defeating the backoff, and would
-        // feed an out-of-order sample into `prev`.
-        let generation = context
-            .get(PROBE_CONTEXT_GENERATION_KEY)
-            .and_then(|g| g.parse::<u64>().ok());
-        if generation != Some(self.generation) {
+        let Some(token) = probe_token_from_context(context) else {
             return;
-        }
-
-        self.probe_in_flight = false;
-        self.missed_ticks = 0;
-        self.abandon_after = MISSED_PROBE_TICKS;
-        if !self.ticker.allow_publication(Instant::now()) {
+        };
+        if !self.probe.complete(token) {
             return;
         }
         let sample = std::str::from_utf8(stdout).ok().and_then(parse_macos_probe);
@@ -270,17 +256,51 @@ impl State {
         let loadavg = loadavg
             .map(|(one, five)| format!("{one} {five}"))
             .unwrap_or_else(|| "-".to_string());
-        push_widget("pipe_netspeed", &netspeed);
-        push_widget("pipe_uptime", &loadavg);
+        self.submit(WidgetValues::new(netspeed, loadavg));
     }
+
+    fn submit(&mut self, values: WidgetValues) {
+        let action = self.broadcaster.submit(values);
+        self.handle_broadcaster_action(action);
+    }
+
+    fn handle_broadcaster_action(&self, action: BroadcasterAction) {
+        if let BroadcasterAction::Schedule(delay) = action {
+            schedule_timer(delay);
+        }
+    }
+}
+
+struct ZellijSink {
+    plugin_id: u32,
+    instance_nonce: u128,
+    lease: SharedPublicationLease<SystemEpochClock>,
+}
+
+impl WidgetSink for ZellijSink {
+    fn publish(&mut self, values: &WidgetValues) -> SinkAction {
+        self.lease.publish(|| {
+            push_widget("pipe_netspeed", &values.netspeed);
+            push_widget("pipe_uptime", &values.uptime);
+            pipe_message_to_plugin(
+                MessageToPlugin::new(PUBLICATION_COMPLETE_MESSAGE)
+                    .with_destination_plugin_id(self.plugin_id)
+                    .with_payload(self.instance_nonce.to_string()),
+            );
+        })
+    }
+}
+
+fn instance_nonce(plugin_id: u32, zellij_pid: u32) -> u128 {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    compose_instance_nonce(timestamp, plugin_id, zellij_pid)
 }
 
 fn schedule_timer(delay: Duration) {
     set_timeout(delay.as_secs_f64());
-}
-
-fn is_macos_probe_result(context: &BTreeMap<String, String>) -> bool {
-    context.get(PROBE_CONTEXT_KEY).map(String::as_str) == Some(PROBE_CONTEXT_VALUE)
 }
 
 /// (interface name, (rx bytes, tx bytes)) of the default-route interface,

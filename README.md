@@ -13,10 +13,10 @@ fire-and-forget children can pile up (on the author's machine: ~2,200 live
 bash processes and a 10-minute OOM storm). zj-sysinfo replaces all of it
 with one active sampler per session that reads `/proc` directly through
 the WASI host filesystem and broadcasts ready-made strings to every
-zjstatus instance. Zellij creates a plugin copy for each client;
-zj-sysinfo elects one connected copy as the publisher. Other copies only
-poll client membership, with snapshot-missing copies backing off to a
-30-second retry.
+zjstatus instance. Zellij creates a plugin copy for each client, but only
+client slot 1 runs zj-sysinfo. Zellij 0.44.3 retains that slot after its
+client disconnects and replaces it when the ID is reused; every other copy
+stays dormant.
 
 - `pipe_netspeed` — `D: 1.2 MB/s U: 340 KB/s` (default-route interface,
   auto-detected, with fallback to the first non-loopback interface with
@@ -37,7 +37,9 @@ The host is detected at runtime (the wasm artifact is platform-neutral).
 The macOS tick is a single `run_command`, but that is four processes: the
 shell plus the three tools. A probe that stops answering is abandoned with
 doubling backoff (up to ~8 min between attempts) and both widgets fall back
-to `-`, so a wedged host slows down rather than accumulating processes.
+to `-`. Zellij cannot cancel `run_command`; a permanently wedged host can
+retain old processes, but replacement attempts are capped at one every
+~8 minutes.
 
 macOS has no `/proc` and exposes counters only through syscalls, so a pure
 WASI read is impossible there. The fallback is still far below the per-tab
@@ -82,8 +84,7 @@ pipe_uptime_rendermode    "static"
 
 ## Permissions (important)
 
-The plugin needs `ReadApplicationState` (elect one publisher from the
-connected clients), `FullHdAccess` (remount `/host` at `/`),
+The plugin needs `FullHdAccess` (remount `/host` at `/`),
 `MessageAndLaunchOtherPlugins` (pipe to zjstatus) and `RunCommands` (the
 macOS probe; requested on every platform because the artifact cannot tell
 them apart at build time). **A background plugin has no pane, so zellij
@@ -98,7 +99,6 @@ zellij resolves the cache through `ProjectDirs`, so it is
 
 ```kdl
 "/home/<you>/.config/zellij-plugins/zj-sysinfo.wasm" {
-    ReadApplicationState
     FullHdAccess
     MessageAndLaunchOtherPlugins
     RunCommands

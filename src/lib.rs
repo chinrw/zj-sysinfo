@@ -1,46 +1,45 @@
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// ListClients is derived from pane metadata and can omit a live client during
-// startup. Missing copies retry forever, but back off to limit zombie work.
-const MAX_MISSING_CLIENT_RETRY: Duration = Duration::from_secs(30);
+pub const ACTIVE_CLIENT_ID: u16 = 1;
+pub const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
+pub const PROBE_CONTEXT_VALUE: &str = "macos-sysinfo";
+pub const PROBE_CONTEXT_NONCE_KEY: &str = "instance-nonce";
+pub const PROBE_CONTEXT_GENERATION_KEY: &str = "generation";
+pub const PUBLICATION_COMPLETE_MESSAGE: &str = "zj-sysinfo-publication-complete";
+
+pub fn is_active_client(client_id: u16) -> bool {
+    client_id == ACTIVE_CLIENT_ID
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerAction {
     Ignore,
-    QueryClients,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientAction {
-    Ignore,
-    Schedule(Duration),
-    Sample,
+    RunCycle,
 }
 
 #[derive(Debug)]
 enum TickerPhase {
     Idle,
     TimerArmed(Instant),
-    ClientQueryInFlight,
-    SamplePending,
+    CyclePending,
 }
 
 #[derive(Debug)]
-pub struct SessionTicker {
+pub struct SampleTicker {
     interval: Duration,
     phase: TickerPhase,
-    missing_client_polls: u8,
-    last_publication: Option<Instant>,
 }
 
-impl SessionTicker {
+impl SampleTicker {
     pub fn new(interval: Duration) -> Self {
         assert!(!interval.is_zero(), "ticker interval must be non-zero");
         Self {
             interval,
             phase: TickerPhase::Idle,
-            missing_client_polls: 0,
-            last_publication: None,
         }
     }
 
@@ -55,82 +54,417 @@ impl SessionTicker {
     pub fn on_timer(&mut self, now: Instant) -> TimerAction {
         match self.phase {
             TickerPhase::TimerArmed(due) if now >= due => {
-                self.phase = TickerPhase::ClientQueryInFlight;
-                TimerAction::QueryClients
+                self.phase = TickerPhase::CyclePending;
+                TimerAction::RunCycle
             }
             _ => TimerAction::Ignore,
         }
     }
 
-    pub fn on_clients<I>(
-        &mut self,
-        now: Instant,
-        own_client_id: u16,
-        connected_client_ids: I,
-    ) -> ClientAction
-    where
-        I: IntoIterator<Item = u16>,
-    {
-        if !matches!(self.phase, TickerPhase::ClientQueryInFlight) {
-            return ClientAction::Ignore;
-        }
-        let mut own_client_is_connected = false;
-        let mut publisher = None;
-        for client_id in connected_client_ids {
-            own_client_is_connected |= client_id == own_client_id;
-            publisher = Some(publisher.map_or(client_id, |current: u16| current.min(client_id)));
-        }
-        if !own_client_is_connected {
-            self.missing_client_polls = self.missing_client_polls.saturating_add(1);
-            self.last_publication = None;
-            let delay = self.missing_client_retry();
-            self.arm(now, delay);
-            return ClientAction::Schedule(delay);
-        }
-
-        self.missing_client_polls = 0;
-        if publisher == Some(own_client_id) {
-            self.phase = TickerPhase::SamplePending;
-            ClientAction::Sample
-        } else {
-            self.last_publication = None;
-            let delay = self.interval;
-            self.arm(now, delay);
-            ClientAction::Schedule(delay)
-        }
-    }
-
-    pub fn on_sample_cycle_completed(&mut self, now: Instant) -> Duration {
+    pub fn on_cycle_completed(&mut self, now: Instant) -> Duration {
         assert!(
-            matches!(self.phase, TickerPhase::SamplePending),
-            "no sample cycle is pending"
+            matches!(self.phase, TickerPhase::CyclePending),
+            "no cycle is pending"
         );
         let delay = self.interval;
         self.arm(now, delay);
         delay
     }
 
-    pub fn allow_publication(&mut self, now: Instant) -> bool {
-        if self
-            .last_publication
-            .is_some_and(|last| now.saturating_duration_since(last) < self.interval)
-        {
-            return false;
-        }
-        self.last_publication = Some(now);
-        true
-    }
-
     fn arm(&mut self, now: Instant, delay: Duration) {
         self.phase = TickerPhase::TimerArmed(now + delay);
     }
+}
 
-    fn missing_client_retry(&self) -> Duration {
-        let exponent = u32::from(self.missing_client_polls.saturating_sub(1)).min(31);
-        let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-        self.interval
-            .saturating_mul(multiplier)
-            .min(MAX_MISSING_CLIENT_RETRY.max(self.interval))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidgetValues {
+    pub netspeed: String,
+    pub uptime: String,
+}
+
+impl WidgetValues {
+    pub fn new(netspeed: impl Into<String>, uptime: impl Into<String>) -> Self {
+        Self {
+            netspeed: netspeed.into(),
+            uptime: uptime.into(),
+        }
+    }
+}
+
+pub trait Clock {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub trait WidgetSink {
+    fn publish(&mut self, values: &WidgetValues) -> SinkAction;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkAction {
+    Published,
+    Retry(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcasterAction {
+    None,
+    Schedule(Duration),
+    Published,
+}
+
+pub struct SessionBroadcaster<C, S> {
+    interval: Duration,
+    clock: C,
+    sink: S,
+    startup_not_before: Instant,
+    external_not_before: Option<Instant>,
+    last_completed: Option<Instant>,
+    pending: Option<WidgetValues>,
+    timer_deadline: Option<Instant>,
+}
+
+impl<C, S> SessionBroadcaster<C, S>
+where
+    C: Clock,
+    S: WidgetSink,
+{
+    pub fn new(interval: Duration, clock: C, sink: S) -> Self {
+        assert!(!interval.is_zero(), "publication interval must be non-zero");
+        let startup_not_before = clock.now() + interval;
+        Self {
+            interval,
+            clock,
+            sink,
+            startup_not_before,
+            external_not_before: None,
+            last_completed: None,
+            pending: None,
+            timer_deadline: None,
+        }
+    }
+
+    pub fn submit(&mut self, values: WidgetValues) -> BroadcasterAction {
+        self.pending = Some(values);
+        self.flush_or_schedule()
+    }
+
+    pub fn on_timer(&mut self) -> BroadcasterAction {
+        let Some(deadline) = self.timer_deadline else {
+            return BroadcasterAction::None;
+        };
+        if self.clock.now() < deadline {
+            return BroadcasterAction::None;
+        }
+        self.timer_deadline = None;
+        self.flush_or_schedule()
+    }
+
+    pub fn observe_external_publication(&mut self) -> BroadcasterAction {
+        let not_before = self.clock.now() + self.interval;
+        self.external_not_before = Some(
+            self.external_not_before
+                .map_or(not_before, |current| current.max(not_before)),
+        );
+        self.flush_or_schedule()
+    }
+
+    #[cfg(test)]
+    fn sink(&self) -> &S {
+        &self.sink
+    }
+
+    fn flush_or_schedule(&mut self) -> BroadcasterAction {
+        if self.pending.is_none() {
+            return BroadcasterAction::None;
+        }
+
+        let now = self.clock.now();
+        let due = self.next_due();
+        if now < due {
+            if self.timer_deadline == Some(due) {
+                return BroadcasterAction::None;
+            }
+            self.timer_deadline = Some(due);
+            return BroadcasterAction::Schedule(due.saturating_duration_since(now));
+        }
+
+        self.timer_deadline = None;
+        let values = self.pending.take().expect("pending values disappeared");
+        match self.sink.publish(&values) {
+            SinkAction::Published => {
+                self.last_completed = Some(self.clock.now());
+                BroadcasterAction::Published
+            }
+            SinkAction::Retry(delay) => {
+                assert!(!delay.is_zero(), "publication retry must be non-zero");
+                self.pending = Some(values);
+                self.timer_deadline = Some(self.clock.now() + delay);
+                BroadcasterAction::Schedule(delay)
+            }
+        }
+    }
+
+    fn next_due(&self) -> Instant {
+        let mut due = self.startup_not_before;
+        if let Some(external_not_before) = self.external_not_before {
+            due = due.max(external_not_before);
+        }
+        if let Some(last_completed) = self.last_completed {
+            due = due.max(last_completed + self.interval);
+        }
+        due
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeToken {
+    pub instance_nonce: u128,
+    pub generation: u64,
+}
+
+pub fn probe_context(token: ProbeToken) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            PROBE_CONTEXT_KEY.to_string(),
+            PROBE_CONTEXT_VALUE.to_string(),
+        ),
+        (
+            PROBE_CONTEXT_NONCE_KEY.to_string(),
+            token.instance_nonce.to_string(),
+        ),
+        (
+            PROBE_CONTEXT_GENERATION_KEY.to_string(),
+            token.generation.to_string(),
+        ),
+    ])
+}
+
+pub fn probe_token_from_context(context: &BTreeMap<String, String>) -> Option<ProbeToken> {
+    (context.get(PROBE_CONTEXT_KEY).map(String::as_str) == Some(PROBE_CONTEXT_VALUE))
+        .then_some(())?;
+    let instance_nonce = context.get(PROBE_CONTEXT_NONCE_KEY)?.parse().ok()?;
+    let generation = context.get(PROBE_CONTEXT_GENERATION_KEY)?.parse().ok()?;
+    Some(ProbeToken {
+        instance_nonce,
+        generation,
+    })
+}
+
+pub fn publication_completion_nonce(
+    expected_plugin_id: u32,
+    source_plugin_id: Option<u32>,
+    is_private: bool,
+    name: &str,
+    payload: Option<&str>,
+) -> Option<u128> {
+    (is_private
+        && source_plugin_id == Some(expected_plugin_id)
+        && name == PUBLICATION_COMPLETE_MESSAGE)
+        .then_some(())?;
+    payload?.parse().ok()
+}
+
+pub fn compose_instance_nonce(timestamp_nanos: u128, plugin_id: u32, zellij_pid: u32) -> u128 {
+    timestamp_nanos ^ (u128::from(zellij_pid) << 64) ^ u128::from(plugin_id)
+}
+
+pub trait EpochClock {
+    fn now_nanos(&self) -> u128;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemEpochClock;
+
+impl EpochClock for SystemEpochClock {
+    fn now_nanos(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
+}
+
+pub struct SharedPublicationLease<C> {
+    interval: Duration,
+    clock: C,
+    timestamp_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl<C> SharedPublicationLease<C>
+where
+    C: EpochClock,
+{
+    pub fn new(interval: Duration, state_path: PathBuf, clock: C) -> Self {
+        assert!(!interval.is_zero(), "lease interval must be non-zero");
+        let lock_path = state_path.with_extension("lock");
+        Self {
+            interval,
+            clock,
+            timestamp_path: state_path,
+            lock_path,
+        }
+    }
+
+    pub fn publish<F>(&self, publish: F) -> SinkAction
+    where
+        F: FnOnce(),
+    {
+        if fs::create_dir(&self.lock_path).is_err() {
+            return SinkAction::Retry(self.interval);
+        }
+        let mut lock = LeaseLock::new(self.lock_path.clone());
+        let now = self.clock.now_nanos();
+        let last_completed = match fs::read_to_string(&self.timestamp_path) {
+            Ok(timestamp) => match timestamp.trim().parse::<u128>() {
+                Ok(timestamp) => Some(timestamp),
+                Err(_) => return SinkAction::Retry(self.interval),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(_) => return SinkAction::Retry(self.interval),
+        };
+        if let Some(last_completed) = last_completed {
+            let due = last_completed.saturating_add(self.interval.as_nanos());
+            if now < due {
+                return SinkAction::Retry(duration_from_nanos(due - now));
+            }
+        }
+
+        publish();
+        let completed = self.clock.now_nanos();
+        if fs::write(&self.timestamp_path, completed.to_string()).is_err() {
+            // Keep the lock if the timestamp cannot be recorded. Freezing is
+            // safer than allowing a replacement instance to publish early.
+            lock.release_on_drop = false;
+        }
+        SinkAction::Published
+    }
+}
+
+struct LeaseLock {
+    path: PathBuf,
+    release_on_drop: bool,
+}
+
+impl LeaseLock {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            release_on_drop: true,
+        }
+    }
+}
+
+impl Drop for LeaseLock {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
+fn duration_from_nanos(nanos: u128) -> Duration {
+    let seconds = (nanos / 1_000_000_000).min(u128::from(u64::MAX)) as u64;
+    let subsecond_nanos = (nanos % 1_000_000_000) as u32;
+    Duration::new(seconds, subsecond_nanos)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAction {
+    Start(ProbeToken),
+    Wait,
+    Restart(ProbeToken),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePhase {
+    Idle,
+    InFlight { missed_cycles: u32 },
+}
+
+#[derive(Debug)]
+pub struct AsyncProbe {
+    instance_nonce: u128,
+    generation: u64,
+    phase: ProbePhase,
+    initial_abandon_after: u32,
+    abandon_after: u32,
+    max_abandon_after: u32,
+}
+
+impl AsyncProbe {
+    pub fn new(instance_nonce: u128, abandon_after: u32, max_abandon_after: u32) -> Self {
+        assert!(abandon_after > 0, "probe abandonment must be non-zero");
+        assert!(
+            max_abandon_after >= abandon_after,
+            "maximum probe abandonment must cover the initial threshold"
+        );
+        Self {
+            instance_nonce,
+            generation: 0,
+            phase: ProbePhase::Idle,
+            initial_abandon_after: abandon_after,
+            abandon_after,
+            max_abandon_after,
+        }
+    }
+
+    pub fn on_cycle(&mut self) -> ProbeAction {
+        match self.phase {
+            ProbePhase::Idle => ProbeAction::Start(self.start()),
+            ProbePhase::InFlight { missed_cycles } => {
+                let missed_cycles = missed_cycles.saturating_add(1);
+                if missed_cycles < self.abandon_after {
+                    self.phase = ProbePhase::InFlight { missed_cycles };
+                    ProbeAction::Wait
+                } else {
+                    self.abandon_after = self
+                        .abandon_after
+                        .saturating_mul(2)
+                        .min(self.max_abandon_after);
+                    ProbeAction::Restart(self.start())
+                }
+            }
+        }
+    }
+
+    pub fn complete(&mut self, token: ProbeToken) -> bool {
+        if !matches!(self.phase, ProbePhase::InFlight { .. }) || token != self.current_token() {
+            return false;
+        }
+        self.phase = ProbePhase::Idle;
+        self.abandon_after = self.initial_abandon_after;
+        true
+    }
+
+    pub fn cancel(&mut self) {
+        if !matches!(self.phase, ProbePhase::Idle) {
+            self.generation = self.generation.wrapping_add(1);
+            self.phase = ProbePhase::Idle;
+        }
+        self.abandon_after = self.initial_abandon_after;
+    }
+
+    fn start(&mut self) -> ProbeToken {
+        self.generation = self.generation.wrapping_add(1);
+        self.phase = ProbePhase::InFlight { missed_cycles: 0 };
+        self.current_token()
+    }
+
+    fn current_token(&self) -> ProbeToken {
+        ProbeToken {
+            instance_nonce: self.instance_nonce,
+            generation: self.generation,
+        }
     }
 }
 
@@ -297,43 +631,168 @@ pub fn format_speed(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     const TICK: Duration = Duration::from_secs(2);
 
-    fn ticker() -> SessionTicker {
-        SessionTicker::new(TICK)
+    fn ticker() -> SampleTicker {
+        SampleTicker::new(TICK)
+    }
+
+    #[derive(Clone)]
+    struct TestClock {
+        now: Rc<Cell<Instant>>,
+    }
+
+    impl TestClock {
+        fn new(now: Instant) -> Self {
+            Self {
+                now: Rc::new(Cell::new(now)),
+            }
+        }
+
+        fn set(&self, now: Instant) {
+            self.now.set(now);
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestEpochClock {
+        now: Rc<Cell<u128>>,
+    }
+
+    impl TestEpochClock {
+        fn new(now: u128) -> Self {
+            Self {
+                now: Rc::new(Cell::new(now)),
+            }
+        }
+
+        fn set(&self, now: u128) {
+            self.now.set(now);
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.now
+                .set(self.now.get().saturating_add(duration.as_nanos()));
+        }
+    }
+
+    impl EpochClock for TestEpochClock {
+        fn now_nanos(&self) -> u128 {
+            self.now.get()
+        }
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("zj-sysinfo-{label}-{}-{id}", std::process::id()));
+            fs::create_dir(&path).expect("failed to create test directory");
+            Self(path)
+        }
+
+        fn state_path(&self) -> PathBuf {
+            self.0.join("publication")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RecordingSink {
+        clock: TestClock,
+        push_duration: Duration,
+        pushes: Vec<(Instant, String, String)>,
+        completed: usize,
+    }
+
+    impl RecordingSink {
+        fn new(clock: TestClock, push_duration: Duration) -> Self {
+            Self {
+                clock,
+                push_duration,
+                pushes: Vec::new(),
+                completed: 0,
+            }
+        }
+    }
+
+    impl WidgetSink for RecordingSink {
+        fn publish(&mut self, values: &WidgetValues) -> SinkAction {
+            self.pushes.push((
+                self.clock.now(),
+                "pipe_netspeed".to_string(),
+                values.netspeed.clone(),
+            ));
+            self.clock.advance(self.push_duration);
+            self.pushes.push((
+                self.clock.now(),
+                "pipe_uptime".to_string(),
+                values.uptime.clone(),
+            ));
+            self.clock.advance(self.push_duration);
+            self.completed += 1;
+            SinkAction::Published
+        }
+    }
+
+    struct RetryOnceSink {
+        attempts: usize,
+        published: Vec<WidgetValues>,
+    }
+
+    impl WidgetSink for RetryOnceSink {
+        fn publish(&mut self, values: &WidgetValues) -> SinkAction {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                SinkAction::Retry(Duration::from_millis(100))
+            } else {
+                self.published.push(values.clone());
+                SinkAction::Published
+            }
+        }
+    }
+
+    fn broadcaster(
+        now: Instant,
+        push_duration: Duration,
+    ) -> (TestClock, SessionBroadcaster<TestClock, RecordingSink>) {
+        let clock = TestClock::new(now);
+        let sink = RecordingSink::new(clock.clone(), push_duration);
+        let broadcaster = SessionBroadcaster::new(TICK, clock.clone(), sink);
+        (clock, broadcaster)
+    }
+
+    fn values(label: &str) -> WidgetValues {
+        WidgetValues::new(format!("net-{label}"), format!("load-{label}"))
     }
 
     #[test]
     #[should_panic(expected = "ticker interval must be non-zero")]
     fn ticker_rejects_zero_interval() {
-        SessionTicker::new(Duration::ZERO);
-    }
-
-    #[test]
-    fn client_scoped_instances_choose_one_session_publisher() {
-        let now = Instant::now();
-        let mut first = ticker();
-        let mut second = ticker();
-
-        assert_eq!(first.start(now), Some(Duration::ZERO));
-        assert_eq!(second.start(now), Some(Duration::ZERO));
-        assert_eq!(first.on_timer(now), TimerAction::QueryClients);
-        assert_eq!(second.on_timer(now), TimerAction::QueryClients);
-
-        let actions = [
-            first.on_clients(now, 1, [1, 2]),
-            second.on_clients(now, 2, [1, 2]),
-        ];
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|action| matches!(action, ClientAction::Sample))
-                .count(),
-            1
-        );
-        assert_eq!(first.on_sample_cycle_completed(now), TICK);
+        SampleTicker::new(Duration::ZERO);
     }
 
     #[test]
@@ -342,116 +801,360 @@ mod tests {
         let mut ticker = ticker();
 
         assert_eq!(ticker.start(now), Some(Duration::ZERO));
-        assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
+        assert_eq!(ticker.on_timer(now), TimerAction::RunCycle);
         assert_eq!(ticker.on_timer(now), TimerAction::Ignore);
-        assert_eq!(ticker.on_clients(now, 1, [1]), ClientAction::Sample);
-        assert_eq!(ticker.on_sample_cycle_completed(now), TICK);
+        assert_eq!(ticker.on_cycle_completed(now), TICK);
         assert_eq!(
             ticker.on_timer(now + Duration::from_secs(1)),
             TimerAction::Ignore
         );
-        assert_eq!(ticker.on_timer(now + TICK), TimerAction::QueryClients);
+        assert_eq!(ticker.on_timer(now + TICK), TimerAction::RunCycle);
     }
 
     #[test]
-    fn session_ticker_review_regression_anchors_publish_interval() {
+    fn ticker_anchors_next_cycle_after_current_work() {
         let now = Instant::now();
-        let response_latency = Duration::from_millis(1_800);
-        let first_snapshot = now + response_latency;
-        let publication_work = Duration::from_millis(400);
         let mut ticker = ticker();
 
         ticker.start(now);
-        ticker.on_timer(now);
-
-        assert_eq!(
-            ticker.on_clients(first_snapshot, 1, [1]),
-            ClientAction::Sample
-        );
+        assert_eq!(ticker.on_timer(now), TimerAction::RunCycle);
+        let completed = now + Duration::from_millis(400);
+        assert_eq!(ticker.on_cycle_completed(completed), TICK);
         assert_eq!(ticker.on_timer(now + TICK), TimerAction::Ignore);
-
-        let first_publication = first_snapshot + publication_work;
-        assert_eq!(ticker.on_sample_cycle_completed(first_publication), TICK);
-        assert_eq!(ticker.on_timer(first_snapshot + TICK), TimerAction::Ignore);
-
-        let next_query = first_publication + TICK;
-        assert_eq!(ticker.on_timer(next_query), TimerAction::QueryClients);
-        let second_snapshot = next_query + Duration::from_millis(100);
-        assert_eq!(
-            ticker.on_clients(second_snapshot, 1, [1]),
-            ClientAction::Sample
-        );
-        let second_publication = second_snapshot + Duration::from_millis(100);
-        assert_eq!(ticker.on_sample_cycle_completed(second_publication), TICK);
-        assert!(second_publication.duration_since(first_publication) >= TICK);
+        assert_eq!(ticker.on_timer(completed + TICK), TimerAction::RunCycle);
     }
 
     #[test]
-    fn async_results_cannot_compress_publication_interval() {
+    fn cooldown_coalesces_the_latest_payload() {
         let now = Instant::now();
-        let mut ticker = ticker();
-        let first_result = now + Duration::from_millis(1_900);
+        let (clock, mut broadcaster) = broadcaster(now, Duration::ZERO);
 
-        assert!(ticker.allow_publication(first_result));
-        assert!(!ticker.allow_publication(now + Duration::from_millis(2_100)));
-        assert!(ticker.allow_publication(first_result + TICK));
+        assert_eq!(
+            broadcaster.submit(values("old")),
+            BroadcasterAction::Schedule(TICK)
+        );
+        clock.set(now + Duration::from_secs(1));
+        assert_eq!(broadcaster.submit(values("new")), BroadcasterAction::None);
+        clock.set(now + TICK);
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::None);
+
+        let pushes = &broadcaster.sink().pushes;
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(pushes[0].1, "pipe_netspeed");
+        assert_eq!(pushes[0].2, "net-new");
+        assert_eq!(pushes[1].1, "pipe_uptime");
+        assert_eq!(pushes[1].2, "load-new");
+        assert_eq!(broadcaster.sink().completed, 1);
     }
 
     #[test]
-    fn session_ticker_review_regression_recovers_after_omissions() {
-        let mut now = Instant::now();
-        let mut ticker = ticker();
+    fn lease_retry_retains_the_pending_payload() {
+        let now = Instant::now();
+        let clock = TestClock::new(now);
+        let sink = RetryOnceSink {
+            attempts: 0,
+            published: Vec::new(),
+        };
+        let mut broadcaster = SessionBroadcaster::new(TICK, clock.clone(), sink);
 
-        ticker.start(now);
-        ticker.on_timer(now);
-        for delay in [2, 4, 8, 16, 30, 30].map(Duration::from_secs) {
-            assert_eq!(ticker.on_clients(now, 1, []), ClientAction::Schedule(delay));
-            now += delay;
-            assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
+        assert_eq!(
+            broadcaster.submit(values("pending")),
+            BroadcasterAction::Schedule(TICK)
+        );
+        clock.set(now + TICK);
+        assert_eq!(
+            broadcaster.on_timer(),
+            BroadcasterAction::Schedule(Duration::from_millis(100))
+        );
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+        assert_eq!(broadcaster.sink().attempts, 2);
+        assert_eq!(broadcaster.sink().published, vec![values("pending")]);
+    }
+
+    #[test]
+    fn alternating_probe_latency_delays_instead_of_dropping() {
+        let now = Instant::now();
+        let (clock, mut broadcaster) = broadcaster(now, Duration::ZERO);
+
+        clock.set(now + Duration::from_millis(1_900));
+        assert_eq!(
+            broadcaster.submit(values("slow-1")),
+            BroadcasterAction::Schedule(Duration::from_millis(100))
+        );
+        clock.set(now + Duration::from_secs(2));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+
+        clock.set(now + Duration::from_millis(2_100));
+        assert_eq!(
+            broadcaster.submit(values("fast-1")),
+            BroadcasterAction::Schedule(Duration::from_millis(1_900))
+        );
+        clock.set(now + Duration::from_secs(4));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+
+        clock.set(now + Duration::from_millis(5_900));
+        assert_eq!(
+            broadcaster.submit(values("slow-2")),
+            BroadcasterAction::Schedule(Duration::from_millis(100))
+        );
+        clock.set(now + Duration::from_secs(6));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+
+        clock.set(now + Duration::from_millis(6_100));
+        assert_eq!(
+            broadcaster.submit(values("fast-2")),
+            BroadcasterAction::Schedule(Duration::from_millis(1_900))
+        );
+        clock.set(now + Duration::from_secs(8));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+
+        let netspeed: Vec<_> = broadcaster
+            .sink()
+            .pushes
+            .iter()
+            .filter(|(_, widget, _)| widget == "pipe_netspeed")
+            .map(|(at, _, text)| (*at, text.as_str()))
+            .collect();
+        assert_eq!(
+            netspeed,
+            vec![
+                (now + Duration::from_secs(2), "net-slow-1"),
+                (now + Duration::from_secs(4), "net-fast-1"),
+                (now + Duration::from_secs(6), "net-slow-2"),
+                (now + Duration::from_secs(8), "net-fast-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn handover_payloads_share_one_publication_clock() {
+        let now = Instant::now();
+        let (clock, mut broadcaster) = broadcaster(now, Duration::ZERO);
+
+        clock.set(now + TICK);
+        assert_eq!(
+            broadcaster.submit(values("old-instance")),
+            BroadcasterAction::Published
+        );
+        clock.set(now + Duration::from_millis(2_100));
+        assert_eq!(
+            broadcaster.submit(values("replacement")),
+            BroadcasterAction::Schedule(Duration::from_millis(1_900))
+        );
+        clock.set(now + Duration::from_secs(4));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+
+        let publication_times: Vec<_> = broadcaster
+            .sink()
+            .pushes
+            .iter()
+            .filter(|(_, widget, _)| widget == "pipe_netspeed")
+            .map(|(at, _, _)| *at)
+            .collect();
+        assert_eq!(
+            publication_times,
+            vec![now + Duration::from_secs(2), now + Duration::from_secs(4)]
+        );
+    }
+
+    #[test]
+    fn completion_is_recorded_after_both_widget_pushes() {
+        let now = Instant::now();
+        let push_duration = Duration::from_millis(100);
+        let (clock, mut broadcaster) = broadcaster(now, push_duration);
+
+        clock.set(now + TICK);
+        assert_eq!(
+            broadcaster.submit(values("first")),
+            BroadcasterAction::Published
+        );
+        clock.set(now + Duration::from_millis(4_100));
+        assert_eq!(
+            broadcaster.submit(values("second")),
+            BroadcasterAction::Schedule(Duration::from_millis(100))
+        );
+        assert_eq!(broadcaster.sink().pushes.len(), 2);
+
+        clock.set(now + Duration::from_millis(4_200));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+        assert_eq!(broadcaster.sink().pushes.len(), 4);
+    }
+
+    #[test]
+    fn replacement_observes_an_old_instances_late_publication() {
+        let now = Instant::now();
+        let (clock, mut broadcaster) = broadcaster(now, Duration::ZERO);
+
+        assert_eq!(
+            broadcaster.submit(values("replacement")),
+            BroadcasterAction::Schedule(TICK)
+        );
+        clock.set(now + Duration::from_millis(1_900));
+        assert_eq!(
+            broadcaster.observe_external_publication(),
+            BroadcasterAction::Schedule(TICK)
+        );
+        clock.set(now + TICK);
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::None);
+        clock.set(now + Duration::from_millis(3_900));
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+    }
+
+    #[test]
+    fn probe_restarts_with_backoff_and_rejects_stale_results() {
+        let mut probe = AsyncProbe::new(11, 3, 6);
+        let ProbeAction::Start(first) = probe.on_cycle() else {
+            panic!("first cycle did not start a probe");
+        };
+        assert_eq!(probe.on_cycle(), ProbeAction::Wait);
+        assert_eq!(probe.on_cycle(), ProbeAction::Wait);
+        let ProbeAction::Restart(second) = probe.on_cycle() else {
+            panic!("third missed cycle did not restart the probe");
+        };
+        assert_ne!(first, second);
+        assert!(!probe.complete(first));
+        assert!(probe.complete(second));
+
+        let ProbeAction::Start(third) = probe.on_cycle() else {
+            panic!("completion did not return the probe to idle");
+        };
+        assert_eq!(third.generation, second.generation + 1);
+    }
+
+    #[test]
+    fn probe_token_includes_the_plugin_instance_nonce() {
+        let mut current = AsyncProbe::new(11, 3, 6);
+        let mut replacement = AsyncProbe::new(12, 3, 6);
+        let ProbeAction::Start(current_token) = current.on_cycle() else {
+            panic!("current instance did not start a probe");
+        };
+        let ProbeAction::Start(replacement_token) = replacement.on_cycle() else {
+            panic!("replacement instance did not start a probe");
+        };
+
+        assert_eq!(current_token.generation, replacement_token.generation);
+        assert!(!replacement.complete(current_token));
+        assert!(replacement.complete(replacement_token));
+    }
+
+    #[test]
+    fn client_slot_one_is_the_only_active_runtime() {
+        assert!(is_active_client(1));
+        assert!(!is_active_client(0));
+        assert!(!is_active_client(2));
+    }
+
+    #[test]
+    fn probe_context_round_trip_rejects_missing_or_wrong_metadata() {
+        let token = ProbeToken {
+            instance_nonce: 42,
+            generation: 7,
+        };
+        let context = probe_context(token);
+        assert_eq!(probe_token_from_context(&context), Some(token));
+
+        for key in [
+            PROBE_CONTEXT_KEY,
+            PROBE_CONTEXT_NONCE_KEY,
+            PROBE_CONTEXT_GENERATION_KEY,
+        ] {
+            let mut incomplete = context.clone();
+            incomplete.remove(key);
+            assert_eq!(probe_token_from_context(&incomplete), None);
         }
 
-        assert_eq!(ticker.on_clients(now, 1, [1]), ClientAction::Sample);
-        assert_eq!(ticker.on_sample_cycle_completed(now), TICK);
+        let mut wrong_probe = context.clone();
+        wrong_probe.insert(PROBE_CONTEXT_KEY.to_string(), "other".to_string());
+        assert_eq!(probe_token_from_context(&wrong_probe), None);
 
-        now += TICK;
-        assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
-        assert_eq!(ticker.on_clients(now, 1, []), ClientAction::Schedule(TICK));
+        let mut malformed = context;
+        malformed.insert(PROBE_CONTEXT_GENERATION_KEY.to_string(), "NaN".to_string());
+        assert_eq!(probe_token_from_context(&malformed), None);
     }
 
     #[test]
-    fn connected_follower_takes_over_when_the_publisher_disconnects() {
-        let now = Instant::now();
-        let mut first = ticker();
-        let mut second = ticker();
+    fn publication_completion_requires_a_private_message_from_this_plugin() {
+        let parse = |source_plugin_id, is_private, name: &str, payload| {
+            publication_completion_nonce(17, source_plugin_id, is_private, name, payload)
+        };
 
-        first.start(now);
-        second.start(now);
-        first.on_timer(now);
-        second.on_timer(now);
-        assert!(matches!(
-            first.on_clients(now, 1, [1, 2]),
-            ClientAction::Sample
-        ));
-        first.on_sample_cycle_completed(now);
-        assert!(matches!(
-            second.on_clients(now, 2, [1, 2]),
-            ClientAction::Schedule(_)
-        ));
-
-        first.on_timer(now + TICK);
-        second.on_timer(now + TICK);
-        let actions = [
-            first.on_clients(now + TICK, 1, [2]),
-            second.on_clients(now + TICK, 2, [2]),
-        ];
         assert_eq!(
-            actions
-                .iter()
-                .filter(|action| matches!(action, ClientAction::Sample))
-                .count(),
-            1
+            parse(Some(17), true, PUBLICATION_COMPLETE_MESSAGE, Some("42")),
+            Some(42)
         );
-        second.on_sample_cycle_completed(now + TICK);
+        assert_eq!(
+            parse(Some(18), true, PUBLICATION_COMPLETE_MESSAGE, Some("42")),
+            None
+        );
+        assert_eq!(
+            parse(Some(17), false, PUBLICATION_COMPLETE_MESSAGE, Some("42")),
+            None
+        );
+        assert_eq!(parse(Some(17), true, "other", Some("42")), None);
+        assert_eq!(
+            parse(Some(17), true, PUBLICATION_COMPLETE_MESSAGE, Some("NaN")),
+            None
+        );
+    }
+
+    #[test]
+    fn instance_nonce_changes_with_each_identity_component() {
+        let nonce = compose_instance_nonce(1, 2, 3);
+        assert_ne!(nonce, compose_instance_nonce(2, 2, 3));
+        assert_ne!(nonce, compose_instance_nonce(1, 3, 3));
+        assert_ne!(nonce, compose_instance_nonce(1, 2, 4));
+    }
+
+    #[test]
+    fn shared_lease_serializes_replacement_publications() {
+        let directory = TestDirectory::new("shared-lease");
+        let clock = TestEpochClock::new(1_000_000_000);
+        let first = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
+        let replacement = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
+        let publications = Rc::new(Cell::new(0));
+
+        let first_publications = publications.clone();
+        assert_eq!(
+            first.publish(|| {
+                first_publications.set(first_publications.get() + 1);
+                clock.advance(Duration::from_millis(200));
+            }),
+            SinkAction::Published
+        );
+
+        clock.set(3_100_000_000);
+        let replacement_publications = publications.clone();
+        assert_eq!(
+            replacement
+                .publish(|| { replacement_publications.set(replacement_publications.get() + 1) }),
+            SinkAction::Retry(Duration::from_millis(100))
+        );
+        assert_eq!(publications.get(), 1);
+
+        clock.set(3_200_000_000);
+        assert_eq!(
+            replacement.publish(|| publications.set(publications.get() + 1)),
+            SinkAction::Published
+        );
+        assert_eq!(publications.get(), 2);
+    }
+
+    #[test]
+    fn shared_lease_never_publishes_while_another_instance_holds_the_lock() {
+        let directory = TestDirectory::new("held-lease");
+        let state_path = directory.state_path();
+        fs::create_dir(state_path.with_extension("lock")).expect("failed to hold test lock");
+        let lease =
+            SharedPublicationLease::new(TICK, state_path, TestEpochClock::new(1_000_000_000));
+        let published = Cell::new(false);
+
+        assert_eq!(
+            lease.publish(|| published.set(true)),
+            SinkAction::Retry(TICK)
+        );
+        assert!(!published.get());
     }
 
     const ROUTE: &str = "\

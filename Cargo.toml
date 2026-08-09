@@ -9,6 +9,7 @@ zellij-tile = "0.44.3"
 [[bin]]
 name = "zj-sysinfo"
 path = "src/main.rs"
+test = false
 
 [profile.release]
 opt-level = "s"
