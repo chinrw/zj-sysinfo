@@ -18,13 +18,19 @@ pub enum ClientAction {
 }
 
 #[derive(Debug)]
+enum TickerPhase {
+    Idle,
+    TimerArmed(Instant),
+    ClientQueryInFlight,
+    SamplePending,
+}
+
+#[derive(Debug)]
 pub struct SessionTicker {
     interval: Duration,
-    next_due: Option<Instant>,
-    timer_armed: bool,
-    client_query_in_flight: bool,
-    sample_pending: bool,
+    phase: TickerPhase,
     missing_client_polls: u8,
+    last_publication: Option<Instant>,
 }
 
 impl SessionTicker {
@@ -32,35 +38,28 @@ impl SessionTicker {
         assert!(!interval.is_zero(), "ticker interval must be non-zero");
         Self {
             interval,
-            next_due: None,
-            timer_armed: false,
-            client_query_in_flight: false,
-            sample_pending: false,
+            phase: TickerPhase::Idle,
             missing_client_polls: 0,
+            last_publication: None,
         }
     }
 
     pub fn start(&mut self, now: Instant) -> Option<Duration> {
-        if self.timer_armed || self.client_query_in_flight || self.sample_pending {
+        if !matches!(self.phase, TickerPhase::Idle) {
             return None;
         }
-        self.next_due = Some(now);
-        self.timer_armed = true;
+        self.phase = TickerPhase::TimerArmed(now);
         Some(Duration::ZERO)
     }
 
     pub fn on_timer(&mut self, now: Instant) -> TimerAction {
-        if !self.timer_armed || self.client_query_in_flight {
-            return TimerAction::Ignore;
+        match self.phase {
+            TickerPhase::TimerArmed(due) if now >= due => {
+                self.phase = TickerPhase::ClientQueryInFlight;
+                TimerAction::QueryClients
+            }
+            _ => TimerAction::Ignore,
         }
-        let due = self.next_due.unwrap_or(now);
-        if now < due {
-            return TimerAction::Ignore;
-        }
-        self.timer_armed = false;
-        self.next_due = None;
-        self.client_query_in_flight = true;
-        TimerAction::QueryClients
     }
 
     pub fn on_clients<I>(
@@ -72,10 +71,9 @@ impl SessionTicker {
     where
         I: IntoIterator<Item = u16>,
     {
-        if !self.client_query_in_flight {
+        if !matches!(self.phase, TickerPhase::ClientQueryInFlight) {
             return ClientAction::Ignore;
         }
-        self.client_query_in_flight = false;
         let mut own_client_is_connected = false;
         let mut publisher = None;
         for client_id in connected_client_ids {
@@ -84,6 +82,7 @@ impl SessionTicker {
         }
         if !own_client_is_connected {
             self.missing_client_polls = self.missing_client_polls.saturating_add(1);
+            self.last_publication = None;
             let delay = self.missing_client_retry();
             self.arm(now, delay);
             return ClientAction::Schedule(delay);
@@ -91,26 +90,39 @@ impl SessionTicker {
 
         self.missing_client_polls = 0;
         if publisher == Some(own_client_id) {
-            self.sample_pending = true;
+            self.phase = TickerPhase::SamplePending;
             ClientAction::Sample
         } else {
+            self.last_publication = None;
             let delay = self.interval;
             self.arm(now, delay);
             ClientAction::Schedule(delay)
         }
     }
 
-    pub fn on_sampled(&mut self, now: Instant) -> Duration {
-        assert!(self.sample_pending, "no sample is pending");
-        self.sample_pending = false;
+    pub fn on_sample_cycle_completed(&mut self, now: Instant) -> Duration {
+        assert!(
+            matches!(self.phase, TickerPhase::SamplePending),
+            "no sample cycle is pending"
+        );
         let delay = self.interval;
         self.arm(now, delay);
         delay
     }
 
+    pub fn allow_publication(&mut self, now: Instant) -> bool {
+        if self
+            .last_publication
+            .is_some_and(|last| now.saturating_duration_since(last) < self.interval)
+        {
+            return false;
+        }
+        self.last_publication = Some(now);
+        true
+    }
+
     fn arm(&mut self, now: Instant, delay: Duration) {
-        self.next_due = Some(now + delay);
-        self.timer_armed = true;
+        self.phase = TickerPhase::TimerArmed(now + delay);
     }
 
     fn missing_client_retry(&self) -> Duration {
@@ -321,7 +333,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(first.on_sampled(now), TICK);
+        assert_eq!(first.on_sample_cycle_completed(now), TICK);
     }
 
     #[test]
@@ -333,7 +345,7 @@ mod tests {
         assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
         assert_eq!(ticker.on_timer(now), TimerAction::Ignore);
         assert_eq!(ticker.on_clients(now, 1, [1]), ClientAction::Sample);
-        assert_eq!(ticker.on_sampled(now), TICK);
+        assert_eq!(ticker.on_sample_cycle_completed(now), TICK);
         assert_eq!(
             ticker.on_timer(now + Duration::from_secs(1)),
             TimerAction::Ignore
@@ -359,7 +371,7 @@ mod tests {
         assert_eq!(ticker.on_timer(now + TICK), TimerAction::Ignore);
 
         let first_publication = first_snapshot + publication_work;
-        assert_eq!(ticker.on_sampled(first_publication), TICK);
+        assert_eq!(ticker.on_sample_cycle_completed(first_publication), TICK);
         assert_eq!(ticker.on_timer(first_snapshot + TICK), TimerAction::Ignore);
 
         let next_query = first_publication + TICK;
@@ -370,8 +382,19 @@ mod tests {
             ClientAction::Sample
         );
         let second_publication = second_snapshot + Duration::from_millis(100);
-        assert_eq!(ticker.on_sampled(second_publication), TICK);
+        assert_eq!(ticker.on_sample_cycle_completed(second_publication), TICK);
         assert!(second_publication.duration_since(first_publication) >= TICK);
+    }
+
+    #[test]
+    fn async_results_cannot_compress_publication_interval() {
+        let now = Instant::now();
+        let mut ticker = ticker();
+        let first_result = now + Duration::from_millis(1_900);
+
+        assert!(ticker.allow_publication(first_result));
+        assert!(!ticker.allow_publication(now + Duration::from_millis(2_100)));
+        assert!(ticker.allow_publication(first_result + TICK));
     }
 
     #[test]
@@ -388,7 +411,7 @@ mod tests {
         }
 
         assert_eq!(ticker.on_clients(now, 1, [1]), ClientAction::Sample);
-        assert_eq!(ticker.on_sampled(now), TICK);
+        assert_eq!(ticker.on_sample_cycle_completed(now), TICK);
 
         now += TICK;
         assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
@@ -409,7 +432,7 @@ mod tests {
             first.on_clients(now, 1, [1, 2]),
             ClientAction::Sample
         ));
-        first.on_sampled(now);
+        first.on_sample_cycle_completed(now);
         assert!(matches!(
             second.on_clients(now, 2, [1, 2]),
             ClientAction::Schedule(_)
@@ -428,7 +451,7 @@ mod tests {
                 .count(),
             1
         );
-        second.on_sampled(now + TICK);
+        second.on_sample_cycle_completed(now + TICK);
     }
 
     const ROUTE: &str = "\

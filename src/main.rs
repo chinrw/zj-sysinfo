@@ -142,7 +142,7 @@ impl State {
             ClientAction::Sample => {
                 self.is_publisher = true;
                 self.tick();
-                let delay = self.ticker.on_sampled(Instant::now());
+                let delay = self.ticker.on_sample_cycle_completed(Instant::now());
                 schedule_timer(delay);
             }
         }
@@ -174,6 +174,9 @@ impl State {
     }
 
     fn tick_linux(&mut self) {
+        if !self.ticker.allow_publication(Instant::now()) {
+            return;
+        }
         push_widget("pipe_netspeed", &self.netspeed_text());
         push_widget("pipe_uptime", &loadavg_text());
     }
@@ -233,6 +236,9 @@ impl State {
 
     fn report_unavailable(&mut self) {
         self.prev = None;
+        if !self.ticker.allow_publication(Instant::now()) {
+            return;
+        }
         push_widget("pipe_netspeed", "-");
         push_widget("pipe_uptime", "-");
     }
@@ -251,6 +257,9 @@ impl State {
         self.probe_in_flight = false;
         self.missed_ticks = 0;
         self.abandon_after = MISSED_PROBE_TICKS;
+        if !self.ticker.allow_publication(Instant::now()) {
+            return;
+        }
         let sample = std::str::from_utf8(stdout).ok().and_then(parse_macos_probe);
         let (counters, loadavg) = match sample {
             Some(sample) => (sample.counters, sample.loadavg),

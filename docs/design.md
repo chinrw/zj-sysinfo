@@ -21,8 +21,10 @@ but keeps retrying at 2, 4, 8, 16, then 30-second intervals; snapshot
 absence is not an authoritative disconnect signal. The next sampling
 deadline is armed only after the current sampling attempt returns, so
 snapshot and synchronous publication latency cannot compress the next
-launch below 2 seconds. A deadline gate also collapses stale timer events.
-This requires the additional `ReadApplicationState` permission.
+launch below 2 seconds. Async probe results pass through a separate
+2-second publication gate so variable completion latency cannot bunch
+widget updates. A timer deadline also collapses stale events. This requires
+the additional `ReadApplicationState` permission.
 
 ## Problem
 
