@@ -14,12 +14,15 @@ client receives another copy, while disconnecting a client does not remove
 its copy. The original `1 instance/session` assumption below is therefore
 not the runtime contract.
 
-The plugin now queries connected clients every 2 seconds. The connected
-copy with the lowest client ID is the only sampler and broadcaster;
-connected followers keep polling for handover, and a disconnected copy
-stops its timer after one grace poll. A deadline gate also collapses stale
-timer events that Zellij can deliver after replacing a client copy. This
-requires the additional `ReadApplicationState` permission.
+The connected copy with the lowest client ID is the only sampler and
+broadcaster. Connected followers poll every 2 seconds for handover. A copy
+missing from the pane-derived client snapshot stops sampling immediately
+but keeps retrying at 2, 4, 8, 16, then 30-second intervals; snapshot
+absence is not an authoritative disconnect signal. Sampling deadlines are
+anchored to the completed snapshot, so variable response latency cannot
+compress the publication interval below 2 seconds. A deadline gate also
+collapses stale timer events. This requires the additional
+`ReadApplicationState` permission.
 
 ## Problem
 

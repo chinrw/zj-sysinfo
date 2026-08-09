@@ -14,8 +14,9 @@ bash processes and a 10-minute OOM storm). zj-sysinfo replaces all of it
 with one active sampler per session that reads `/proc` directly through
 the WASI host filesystem and broadcasts ready-made strings to every
 zjstatus instance. Zellij creates a plugin copy for each client;
-zj-sysinfo elects one connected copy as the publisher and leaves the
-others idle.
+zj-sysinfo elects one connected copy as the publisher. Other copies only
+poll client membership, with snapshot-missing copies backing off to a
+30-second retry.
 
 - `pipe_netspeed` — `D: 1.2 MB/s U: 340 KB/s` (default-route interface,
   auto-detected, with fallback to the first non-loopback interface with

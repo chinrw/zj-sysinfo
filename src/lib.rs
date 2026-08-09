@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-// add_client() starts loading plugin copies before it records the client as
-// connected. One miss avoids retiring a new copy during that window.
-const MISSING_CLIENT_POLLS_BEFORE_STOP: u8 = 2;
+// ListClients is derived from pane metadata and can omit a live client during
+// startup. Missing copies retry forever, but back off to limit zombie work.
+const MAX_MISSING_CLIENT_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerAction {
@@ -13,7 +13,6 @@ pub enum TimerAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientAction {
     Ignore,
-    Stop,
     Schedule(Duration),
     PublishAndSchedule(Duration),
 }
@@ -36,7 +35,7 @@ impl SessionTicker {
         Some(Duration::ZERO)
     }
 
-    pub fn on_timer(&mut self, now: Instant, interval: Duration) -> TimerAction {
+    pub fn on_timer(&mut self, now: Instant) -> TimerAction {
         if !self.timer_armed || self.client_query_in_flight {
             return TimerAction::Ignore;
         }
@@ -45,7 +44,7 @@ impl SessionTicker {
             return TimerAction::Ignore;
         }
         self.timer_armed = false;
-        self.next_due = Some(now + interval);
+        self.next_due = None;
         self.client_query_in_flight = true;
         TimerAction::QueryClients
     }
@@ -53,6 +52,7 @@ impl SessionTicker {
     pub fn on_clients<I>(
         &mut self,
         now: Instant,
+        interval: Duration,
         own_client_id: u16,
         connected_client_ids: I,
     ) -> ClientAction
@@ -63,10 +63,6 @@ impl SessionTicker {
             return ClientAction::Ignore;
         }
         self.client_query_in_flight = false;
-        let delay = self
-            .next_due
-            .map(|due| due.saturating_duration_since(now))
-            .unwrap_or_default();
         let mut own_client_is_connected = false;
         let mut publisher = None;
         for client_id in connected_client_ids {
@@ -75,22 +71,32 @@ impl SessionTicker {
         }
         if !own_client_is_connected {
             self.missing_client_polls = self.missing_client_polls.saturating_add(1);
-            if self.missing_client_polls >= MISSING_CLIENT_POLLS_BEFORE_STOP {
-                self.next_due = None;
-                return ClientAction::Stop;
-            }
-            self.timer_armed = true;
+            let delay = missing_client_retry(interval, self.missing_client_polls);
+            self.arm(now, delay);
             return ClientAction::Schedule(delay);
         }
 
         self.missing_client_polls = 0;
-        self.timer_armed = true;
+        self.arm(now, interval);
         if publisher == Some(own_client_id) {
-            ClientAction::PublishAndSchedule(delay)
+            ClientAction::PublishAndSchedule(interval)
         } else {
-            ClientAction::Schedule(delay)
+            ClientAction::Schedule(interval)
         }
     }
+
+    fn arm(&mut self, now: Instant, delay: Duration) {
+        self.next_due = Some(now + delay);
+        self.timer_armed = true;
+    }
+}
+
+fn missing_client_retry(interval: Duration, missing_client_polls: u8) -> Duration {
+    let exponent = u32::from(missing_client_polls.saturating_sub(1)).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    interval
+        .saturating_mul(multiplier)
+        .min(MAX_MISSING_CLIENT_RETRY.max(interval))
 }
 
 /// First route whose Destination is 00000000 (the default route).
@@ -268,12 +274,12 @@ mod tests {
 
         assert_eq!(first.start(now), Some(Duration::ZERO));
         assert_eq!(second.start(now), Some(Duration::ZERO));
-        assert_eq!(first.on_timer(now, TICK), TimerAction::QueryClients);
-        assert_eq!(second.on_timer(now, TICK), TimerAction::QueryClients);
+        assert_eq!(first.on_timer(now), TimerAction::QueryClients);
+        assert_eq!(second.on_timer(now), TimerAction::QueryClients);
 
         let actions = [
-            first.on_clients(now, 1, [1, 2]),
-            second.on_clients(now, 2, [1, 2]),
+            first.on_clients(now, TICK, 1, [1, 2]),
+            second.on_clients(now, TICK, 2, [1, 2]),
         ];
         assert_eq!(
             actions
@@ -290,29 +296,79 @@ mod tests {
         let mut ticker = SessionTicker::default();
 
         assert_eq!(ticker.start(now), Some(Duration::ZERO));
-        assert_eq!(ticker.on_timer(now, TICK), TimerAction::QueryClients);
-        assert_eq!(ticker.on_timer(now, TICK), TimerAction::Ignore);
+        assert_eq!(ticker.on_timer(now), TimerAction::QueryClients);
+        assert_eq!(ticker.on_timer(now), TimerAction::Ignore);
         assert_eq!(
-            ticker.on_clients(now, 1, [1]),
+            ticker.on_clients(now, TICK, 1, [1]),
             ClientAction::PublishAndSchedule(TICK)
         );
         assert_eq!(
-            ticker.on_timer(now + Duration::from_secs(1), TICK),
+            ticker.on_timer(now + Duration::from_secs(1)),
             TimerAction::Ignore
         );
-        assert_eq!(ticker.on_timer(now + TICK, TICK), TimerAction::QueryClients);
+        assert_eq!(ticker.on_timer(now + TICK), TimerAction::QueryClients);
     }
 
     #[test]
-    fn disconnected_instance_stops_after_a_transient_miss() {
+    fn session_ticker_review_regression_anchors_publish_interval() {
+        let now = Instant::now();
+        let response_latency = Duration::from_millis(1_800);
+        let first_publication = now + response_latency;
+        let mut ticker = SessionTicker::default();
+
+        ticker.start(now);
+        ticker.on_timer(now);
+
+        assert_eq!(
+            ticker.on_clients(first_publication, TICK, 1, [1]),
+            ClientAction::PublishAndSchedule(TICK)
+        );
+        assert_eq!(ticker.on_timer(now + TICK), TimerAction::Ignore);
+
+        let next_query = first_publication + TICK;
+        assert_eq!(ticker.on_timer(next_query), TimerAction::QueryClients);
+        let second_publication = next_query + Duration::from_millis(100);
+        assert_eq!(
+            ticker.on_clients(second_publication, TICK, 1, [1]),
+            ClientAction::PublishAndSchedule(TICK)
+        );
+        assert!(second_publication.duration_since(first_publication) >= TICK);
+    }
+
+    #[test]
+    fn session_ticker_review_regression_recovers_after_omissions() {
         let now = Instant::now();
         let mut ticker = SessionTicker::default();
 
-        assert_eq!(ticker.start(now), Some(Duration::ZERO));
-        assert_eq!(ticker.on_timer(now, TICK), TimerAction::QueryClients);
-        assert_eq!(ticker.on_clients(now, 1, [2]), ClientAction::Schedule(TICK));
-        assert_eq!(ticker.on_timer(now + TICK, TICK), TimerAction::QueryClients);
-        assert_eq!(ticker.on_clients(now + TICK, 1, [2]), ClientAction::Stop);
+        ticker.start(now);
+        ticker.on_timer(now);
+        assert_eq!(
+            ticker.on_clients(now, TICK, 1, []),
+            ClientAction::Schedule(TICK)
+        );
+
+        ticker.on_timer(now + TICK);
+        assert_eq!(
+            ticker.on_clients(now + TICK, TICK, 1, []),
+            ClientAction::Schedule(Duration::from_secs(4))
+        );
+
+        let recovered_at = now + Duration::from_secs(6);
+        assert_eq!(ticker.on_timer(recovered_at), TimerAction::QueryClients);
+        assert_eq!(
+            ticker.on_clients(recovered_at, TICK, 1, [1]),
+            ClientAction::PublishAndSchedule(TICK)
+        );
+    }
+
+    #[test]
+    fn missing_client_retry_backs_off_and_caps() {
+        assert_eq!(missing_client_retry(TICK, 1), Duration::from_secs(2));
+        assert_eq!(missing_client_retry(TICK, 2), Duration::from_secs(4));
+        assert_eq!(missing_client_retry(TICK, 3), Duration::from_secs(8));
+        assert_eq!(missing_client_retry(TICK, 4), Duration::from_secs(16));
+        assert_eq!(missing_client_retry(TICK, 5), Duration::from_secs(30));
+        assert_eq!(missing_client_retry(TICK, u8::MAX), Duration::from_secs(30));
     }
 
     #[test]
@@ -323,22 +379,22 @@ mod tests {
 
         first.start(now);
         second.start(now);
-        first.on_timer(now, TICK);
-        second.on_timer(now, TICK);
+        first.on_timer(now);
+        second.on_timer(now);
         assert!(matches!(
-            first.on_clients(now, 1, [1, 2]),
+            first.on_clients(now, TICK, 1, [1, 2]),
             ClientAction::PublishAndSchedule(_)
         ));
         assert!(matches!(
-            second.on_clients(now, 2, [1, 2]),
+            second.on_clients(now, TICK, 2, [1, 2]),
             ClientAction::Schedule(_)
         ));
 
-        first.on_timer(now + TICK, TICK);
-        second.on_timer(now + TICK, TICK);
+        first.on_timer(now + TICK);
+        second.on_timer(now + TICK);
         let actions = [
-            first.on_clients(now + TICK, 1, [2]),
-            second.on_clients(now + TICK, 2, [2]),
+            first.on_clients(now + TICK, TICK, 1, [2]),
+            second.on_clients(now + TICK, TICK, 2, [2]),
         ];
         assert_eq!(
             actions

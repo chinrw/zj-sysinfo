@@ -105,7 +105,7 @@ impl ZellijPlugin for State {
                 ]);
             }
             Event::Timer(_) if self.granted => {
-                if self.ticker.on_timer(Instant::now(), INTERVAL) == TimerAction::QueryClients {
+                if self.ticker.on_timer(Instant::now()) == TimerAction::QueryClients {
                     list_clients();
                 }
             }
@@ -115,6 +115,7 @@ impl ZellijPlugin for State {
                 };
                 let action = self.ticker.on_clients(
                     Instant::now(),
+                    INTERVAL,
                     client_id,
                     clients.into_iter().map(|client| client.client_id),
                 );
@@ -135,7 +136,6 @@ impl State {
     fn handle_client_action(&mut self, action: ClientAction) {
         match action {
             ClientAction::Ignore => {}
-            ClientAction::Stop => self.deactivate_publisher(),
             ClientAction::Schedule(delay) => {
                 self.deactivate_publisher();
                 schedule_timer(delay);
