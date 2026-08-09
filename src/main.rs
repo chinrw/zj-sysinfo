@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -6,10 +7,10 @@ use zellij_tile::prelude::*;
 
 use zj_sysinfo::{
     default_iface, fallback_iface, format_speed, iface_bytes, instance_nonce_from_random,
-    is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
-    publication_completion_nonce, rate, AsyncProbe, BroadcasterAction, ProbeAction, ProbeToken,
-    SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
-    SystemMonotonicClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
+    is_active_client, loadavg, next_fallback_instance_nonce, parse_macos_probe, probe_context,
+    probe_token_from_context, publication_completion_nonce, rate, AsyncProbe, BroadcasterAction,
+    ProbeAction, ProbeToken, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction,
+    SystemClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
 
 const INTERVAL: Duration = Duration::from_secs(2);
@@ -49,8 +50,8 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(plugin_id: u32, zellij_pid: u32) -> Result<Self, getrandom::Error> {
-        let instance_nonce = instance_nonce()?;
+    fn new(plugin_id: u32, zellij_pid: u32) -> io::Result<Self> {
+        let instance_nonce = instance_nonce(plugin_id, zellij_pid)?;
         Ok(Self {
             granted: false,
             plugin_id,
@@ -67,7 +68,7 @@ impl Runtime {
                         PathBuf::from(format!(
                             "/cache/zj-sysinfo-{zellij_pid}-{plugin_id}.publication"
                         )),
-                        SystemMonotonicClock,
+                        instance_nonce,
                     ),
                 },
             ),
@@ -92,7 +93,7 @@ impl ZellijPlugin for State {
         let runtime = match Runtime::new(ids.plugin_id, ids.zellij_pid) {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("zj-sysinfo: failed to create an instance nonce: {error}");
+                eprintln!("zj-sysinfo: failed to allocate an instance nonce: {error}");
                 return;
             }
         };
@@ -281,7 +282,7 @@ impl Runtime {
 struct ZellijSink {
     plugin_id: u32,
     instance_nonce: u128,
-    lease: SharedPublicationLease<SystemMonotonicClock>,
+    lease: SharedPublicationLease,
 }
 
 impl WidgetSink for ZellijSink {
@@ -298,10 +299,26 @@ impl WidgetSink for ZellijSink {
     }
 }
 
-fn instance_nonce() -> Result<u128, getrandom::Error> {
+fn instance_nonce(plugin_id: u32, zellij_pid: u32) -> io::Result<u128> {
     let mut random = [0; 16];
-    getrandom::getrandom(&mut random)?;
-    Ok(instance_nonce_from_random(random))
+    match getrandom::getrandom(&mut random) {
+        Ok(()) => Ok(instance_nonce_from_random(random)),
+        Err(random_error) => {
+            eprintln!(
+                "zj-sysinfo: random nonce unavailable ({random_error}); using persistent counter"
+            );
+            let state_path =
+                PathBuf::from(format!("/cache/zj-sysinfo-{zellij_pid}-{plugin_id}.nonce"));
+            next_fallback_instance_nonce(&state_path).map_err(|fallback_error| {
+                io::Error::new(
+                    fallback_error.kind(),
+                    format!(
+                        "random source failed ({random_error}); counter failed ({fallback_error})"
+                    ),
+                )
+            })
+        }
+    }
 }
 
 fn schedule_timer(delay: Duration) {

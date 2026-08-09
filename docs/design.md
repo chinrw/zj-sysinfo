@@ -24,21 +24,25 @@ Every sample goes through one `SessionBroadcaster`. It retains the latest
 pending values, pushes the two widgets together when due, and records the
 completion time only after the second push. Early async results are delayed
 instead of dropped. Before publishing, the sink takes an atomic marker in the
-plugin's shared `/cache` directory and checks a WASI monotonic completion
-timestamp scoped by Zellij PID and plugin ID. Zellij runs callbacks and
-replacement loads for one plugin ID on a single FIFO executor. A later callback
-can therefore repair a marker left by a trap, record a conservative completion
-time, and wait another interval without racing the old instance. Timestamp
-replacement is atomic; persistent cache write or removal failures stay
-fail-closed. A private completion message updates the replacement's local
-deadline early, but the shared lease is authoritative. Timer deadlines collapse
-stale events and preserve sink retry deadlines across new samples.
+plugin's shared `/cache` directory and checks a completion token scoped by
+Zellij PID and plugin ID. Each successful pair atomically replaces the token
+with its instance nonce and local generation. An instance that observes
+an unfamiliar token waits a full interval on its own monotonic clock, avoiding
+both wall-clock jumps and per-WASI-context clock epochs. Zellij runs callbacks
+and replacement loads for one plugin ID on a single FIFO executor. A later
+callback can therefore repair a marker left by a trap or a legacy/corrupt token
+and wait another interval without racing the old instance. Persistent cache
+write or removal failures stay fail-closed. A private completion message updates
+the replacement's local deadline early, but the shared token is authoritative.
+Timer deadlines collapse stale events and preserve sink retry deadlines across
+new samples.
 
 macOS command launches and completions have a separate lifecycle. Command
 context includes both an instance nonce and a generation, so a result from an
 abandoned probe or replaced slot cannot complete the current probe. Each
 instance nonce comes from the WASI random source rather than a repeatable wall
-clock value.
+clock value. If that source is temporarily unavailable, a separate namespace of
+nonces comes from an atomically persisted per-plugin counter.
 
 ## Problem
 

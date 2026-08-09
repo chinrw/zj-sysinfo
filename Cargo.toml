@@ -7,9 +7,6 @@ edition = "2021"
 getrandom = "0.2"
 zellij-tile = "0.44.3"
 
-[target.'cfg(target_os = "wasi")'.dependencies]
-wasi = "0.11"
-
 [[bin]]
 name = "zj-sysinfo"
 path = "src/main.rs"

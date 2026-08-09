@@ -289,36 +289,48 @@ pub fn publication_completion_nonce(
 }
 
 pub fn instance_nonce_from_random(random: [u8; 16]) -> u128 {
-    u128::from_le_bytes(random)
+    u128::from_le_bytes(random) & (u128::MAX >> 1)
 }
 
-/// Process-wide monotonic nanoseconds. Values must be comparable across every
-/// WASM instance that shares a publication lease.
-pub trait MonotonicClock {
-    fn now_nanos(&self) -> Option<u128>;
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemMonotonicClock;
-
-#[cfg(target_os = "wasi")]
-impl MonotonicClock for SystemMonotonicClock {
-    fn now_nanos(&self) -> Option<u128> {
-        // The WASI host exposes one monotonic clock to every instance in the
-        // Zellij process, so persisted values remain comparable on handover.
-        unsafe { wasi::clock_time_get(wasi::CLOCKID_MONOTONIC, 1) }
+/// Allocate a collision-free nonce when the WASI random source is unavailable.
+/// Calls for one path must be serialized by Zellij's per-plugin FIFO executor.
+pub fn next_fallback_instance_nonce(state_path: &Path) -> io::Result<u128> {
+    const FALLBACK_NAMESPACE: u128 = 1 << 127;
+    let current = match fs::read_to_string(state_path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u128>()
             .ok()
-            .map(u128::from)
-    }
+            .filter(|value| *value < FALLBACK_NAMESPACE)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid nonce counter"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let next = current
+        .checked_add(1)
+        .filter(|value| *value < FALLBACK_NAMESPACE)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "nonce counter exhausted"))?;
+    atomic_replace(state_path, &next.to_string())?;
+    Ok(FALLBACK_NAMESPACE | next)
 }
 
-#[cfg(not(target_os = "wasi"))]
-impl MonotonicClock for SystemMonotonicClock {
-    fn now_nanos(&self) -> Option<u128> {
-        use std::sync::OnceLock;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublicationToken {
+    instance_nonce: u128,
+    generation: u64,
+}
 
-        static START: OnceLock<Instant> = OnceLock::new();
-        Some(START.get_or_init(Instant::now).elapsed().as_nanos())
+impl PublicationToken {
+    fn parse(value: &str) -> Option<Self> {
+        let (instance_nonce, generation) = value.trim().split_once(':')?;
+        Some(Self {
+            instance_nonce: instance_nonce.parse().ok()?,
+            generation: generation.parse().ok()?,
+        })
+    }
+
+    fn encode(self) -> String {
+        format!("{}:{}", self.instance_nonce, self.generation)
     }
 }
 
@@ -326,29 +338,30 @@ impl MonotonicClock for SystemMonotonicClock {
 ///
 /// Calls for one state path must be externally serialized. This lets a later
 /// call treat an existing lock marker as abandoned rather than in flight.
-pub struct SharedPublicationLease<C> {
+pub struct SharedPublicationLease {
     interval: Duration,
-    clock: C,
-    timestamp_path: PathBuf,
+    instance_nonce: u128,
+    next_generation: u64,
+    observed_token: Option<PublicationToken>,
+    state_path: PathBuf,
     lock_path: PathBuf,
 }
 
-impl<C> SharedPublicationLease<C>
-where
-    C: MonotonicClock,
-{
-    pub fn new(interval: Duration, state_path: PathBuf, clock: C) -> Self {
+impl SharedPublicationLease {
+    pub fn new(interval: Duration, state_path: PathBuf, instance_nonce: u128) -> Self {
         assert!(!interval.is_zero(), "lease interval must be non-zero");
         let lock_path = state_path.with_extension("lock");
         Self {
             interval,
-            clock,
-            timestamp_path: state_path,
+            instance_nonce,
+            next_generation: 0,
+            observed_token: None,
+            state_path,
             lock_path,
         }
     }
 
-    pub fn publish<F>(&self, publish: F) -> SinkAction
+    pub fn publish<F>(&mut self, publish: F) -> SinkAction
     where
         F: FnOnce(),
     {
@@ -359,66 +372,72 @@ where
             }
             Err(_) => return SinkAction::Retry(self.interval),
         };
-        let Some(now) = self.clock.now_nanos() else {
-            lock.remove_on_drop = true;
-            return SinkAction::Retry(self.interval);
-        };
-        let last_completed = match fs::read_to_string(&self.timestamp_path) {
-            Ok(timestamp) => match timestamp.trim().parse::<u128>() {
-                Ok(timestamp) => Some(timestamp),
-                Err(_) => return self.repair_timestamp(&mut lock, now),
-            },
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
+        match fs::read_to_string(&self.state_path) {
+            Ok(value) => {
+                let Some(token) = PublicationToken::parse(&value) else {
+                    return self.repair_state(&mut lock);
+                };
+                if self.observed_token != Some(token) {
+                    self.observed_token = Some(token);
+                    lock.remove_on_drop = true;
+                    return SinkAction::Retry(self.interval);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if self.observed_token.take().is_some() {
+                    lock.remove_on_drop = true;
+                    return SinkAction::Retry(self.interval);
+                }
+            }
             Err(_) => {
                 lock.remove_on_drop = true;
                 return SinkAction::Retry(self.interval);
             }
-        };
-        if let Some(last_completed) = last_completed {
-            let due = last_completed.saturating_add(self.interval.as_nanos());
-            if now < due {
-                lock.remove_on_drop = true;
-                return SinkAction::Retry(duration_from_nanos(due - now));
-            }
         }
 
+        let token = self.next_token();
         publish();
-        let Some(completed) = self.clock.now_nanos() else {
-            return SinkAction::Published;
-        };
-        if self.write_timestamp(completed).is_ok() {
+        if self.write_token(token).is_ok() {
+            self.observed_token = Some(token);
             lock.remove_on_drop = true;
         }
         SinkAction::Published
     }
 
-    fn recover_abandoned_lock(&self) -> SinkAction {
+    fn recover_abandoned_lock(&mut self) -> SinkAction {
         // Zellij 0.44.3 executes every callback and replacement load for one
         // plugin_id on the same FIFO thread. Observing this marker therefore
         // proves its callback ended or trapped; it cannot still be publishing.
-        let Some(now) = self.clock.now_nanos() else {
-            return SinkAction::Retry(self.interval);
-        };
-        if self.write_timestamp(now).is_err() {
+        let token = self.next_token();
+        if self.write_token(token).is_err() {
             return SinkAction::Retry(self.interval);
         }
+        self.observed_token = Some(token);
         if remove_lock_path(&self.lock_path).is_err() {
             return SinkAction::Retry(self.interval);
         }
         SinkAction::Retry(self.interval)
     }
 
-    fn repair_timestamp(&self, lock: &mut LeaseLock, now: u128) -> SinkAction {
-        if self.write_timestamp(now).is_ok() {
+    fn repair_state(&mut self, lock: &mut LeaseLock) -> SinkAction {
+        let token = self.next_token();
+        if self.write_token(token).is_ok() {
+            self.observed_token = Some(token);
             lock.remove_on_drop = true;
         }
         SinkAction::Retry(self.interval)
     }
 
-    fn write_timestamp(&self, timestamp: u128) -> io::Result<()> {
-        let temporary_path = self.timestamp_path.with_extension("next");
-        fs::write(&temporary_path, timestamp.to_string())?;
-        fs::rename(temporary_path, &self.timestamp_path)
+    fn next_token(&mut self) -> PublicationToken {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        PublicationToken {
+            instance_nonce: self.instance_nonce,
+            generation: self.next_generation,
+        }
+    }
+
+    fn write_token(&self, token: PublicationToken) -> io::Result<()> {
+        atomic_replace(&self.state_path, &token.encode())
     }
 }
 
@@ -451,10 +470,15 @@ fn remove_lock_path(path: &Path) -> io::Result<()> {
     }
 }
 
-fn duration_from_nanos(nanos: u128) -> Duration {
-    let seconds = (nanos / 1_000_000_000).min(u128::from(u64::MAX)) as u64;
-    let subsecond_nanos = (nanos % 1_000_000_000) as u32;
-    Duration::new(seconds, subsecond_nanos)
+fn atomic_replace(path: &Path, contents: &str) -> io::Result<()> {
+    let mut temporary_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "state path has no file name"))?
+        .to_os_string();
+    temporary_name.push(".next");
+    let temporary_path = path.with_file_name(temporary_name);
+    fs::write(&temporary_path, contents)?;
+    fs::rename(temporary_path, path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,34 +773,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct TestMonotonicClock {
-        now: Rc<Cell<u128>>,
-    }
-
-    impl TestMonotonicClock {
-        fn new(now: u128) -> Self {
-            Self {
-                now: Rc::new(Cell::new(now)),
-            }
-        }
-
-        fn set(&self, now: u128) {
-            self.now.set(now);
-        }
-
-        fn advance(&self, duration: Duration) {
-            self.now
-                .set(self.now.get().saturating_add(duration.as_nanos()));
-        }
-    }
-
-    impl MonotonicClock for TestMonotonicClock {
-        fn now_nanos(&self) -> Option<u128> {
-            Some(self.now.get())
-        }
-    }
-
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -851,6 +847,19 @@ mod tests {
                 self.published.push(values.clone());
                 SinkAction::Published
             }
+        }
+    }
+
+    struct SharedLeaseSink {
+        lease: SharedPublicationLease,
+        publications: Rc<Cell<usize>>,
+    }
+
+    impl WidgetSink for SharedLeaseSink {
+        fn publish(&mut self, _values: &WidgetValues) -> SinkAction {
+            let publications = self.publications.clone();
+            self.lease
+                .publish(|| publications.set(publications.get() + 1))
         }
     }
 
@@ -1184,48 +1193,112 @@ mod tests {
     }
 
     #[test]
-    fn instance_nonce_preserves_all_random_bits() {
+    fn random_and_fallback_nonces_use_disjoint_namespaces() {
         let random = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
         assert_eq!(
             instance_nonce_from_random(random),
-            0xffeeddccbbaa99887766554433221100
+            0x7feeddccbbaa99887766554433221100
         );
+
+        let directory = TestDirectory::new("nonce-counter");
+        let state_path = directory.0.join("nonce");
+        let first = next_fallback_instance_nonce(&state_path).expect("first fallback nonce failed");
+        let second =
+            next_fallback_instance_nonce(&state_path).expect("second fallback nonce failed");
+        assert_eq!(first, (1 << 127) | 1);
+        assert_eq!(second, (1 << 127) | 2);
     }
 
     #[test]
-    fn shared_lease_serializes_replacement_publications() {
+    fn shared_lease_fences_replacement_publications_with_tokens() {
         let directory = TestDirectory::new("shared-lease");
-        let clock = TestMonotonicClock::new(1_000_000_000);
-        let first = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
-        let replacement = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
+        let state_path = directory.state_path();
+        let mut first = SharedPublicationLease::new(TICK, state_path.clone(), 11);
+        let mut replacement = SharedPublicationLease::new(TICK, state_path.clone(), 12);
         let publications = Rc::new(Cell::new(0));
 
         let first_publications = publications.clone();
         assert_eq!(
-            first.publish(|| {
-                first_publications.set(first_publications.get() + 1);
-                clock.advance(Duration::from_millis(200));
-            }),
+            first.publish(|| first_publications.set(first_publications.get() + 1)),
             SinkAction::Published
         );
+        assert_eq!(
+            fs::read_to_string(&state_path).expect("failed to read first token"),
+            "11:1"
+        );
 
-        clock.set(3_100_000_000);
         let replacement_publications = publications.clone();
         assert_eq!(
             replacement
                 .publish(|| { replacement_publications.set(replacement_publications.get() + 1) }),
-            SinkAction::Retry(Duration::from_millis(100))
+            SinkAction::Retry(TICK)
         );
         assert_eq!(publications.get(), 1);
 
-        clock.set(3_200_000_000);
         assert_eq!(
             replacement.publish(|| publications.set(publications.get() + 1)),
             SinkAction::Published
         );
+        assert_eq!(publications.get(), 2);
+        assert_eq!(
+            fs::read_to_string(&state_path).expect("failed to read replacement token"),
+            "12:1"
+        );
+
+        assert_eq!(
+            first.publish(|| publications.set(publications.get() + 1)),
+            SinkAction::Retry(TICK)
+        );
+        assert_eq!(publications.get(), 2);
+    }
+
+    #[test]
+    fn replacement_broadcaster_waits_a_local_interval_for_an_unfamiliar_token() {
+        let directory = TestDirectory::new("replacement-broadcaster");
+        let state_path = directory.state_path();
+        let publications = Rc::new(Cell::new(0));
+
+        let old_now = Instant::now() + Duration::from_secs(60 * 60);
+        let old_clock = TestClock::new(old_now);
+        let mut old = SessionBroadcaster::new(
+            TICK,
+            old_clock.clone(),
+            SharedLeaseSink {
+                lease: SharedPublicationLease::new(TICK, state_path.clone(), 11),
+                publications: publications.clone(),
+            },
+        );
+        assert_eq!(old.submit(values("old")), BroadcasterAction::Schedule(TICK));
+        old_clock.advance(TICK);
+        assert_eq!(old.on_timer(), BroadcasterAction::Published);
+
+        let replacement_now = Instant::now();
+        let replacement_clock = TestClock::new(replacement_now);
+        let mut replacement = SessionBroadcaster::new(
+            TICK,
+            replacement_clock.clone(),
+            SharedLeaseSink {
+                lease: SharedPublicationLease::new(TICK, state_path, 12),
+                publications: publications.clone(),
+            },
+        );
+        assert_eq!(
+            replacement.submit(values("replacement")),
+            BroadcasterAction::Schedule(TICK)
+        );
+        replacement_clock.advance(TICK);
+        assert_eq!(replacement.on_timer(), BroadcasterAction::Schedule(TICK));
+        assert_eq!(publications.get(), 1);
+
+        assert_eq!(
+            replacement.submit(values("latest")),
+            BroadcasterAction::None
+        );
+        replacement_clock.advance(TICK);
+        assert_eq!(replacement.on_timer(), BroadcasterAction::Published);
         assert_eq!(publications.get(), 2);
     }
 
@@ -1235,8 +1308,7 @@ mod tests {
         let state_path = directory.state_path();
         let lock_path = state_path.with_extension("lock");
         fs::create_dir(&lock_path).expect("failed to hold test lock");
-        let clock = TestMonotonicClock::new(1_000_000_000);
-        let lease = SharedPublicationLease::new(TICK, state_path.clone(), clock.clone());
+        let mut lease = SharedPublicationLease::new(TICK, state_path.clone(), 7);
         let published = Cell::new(false);
 
         assert_eq!(
@@ -1246,37 +1318,39 @@ mod tests {
         assert!(!published.get());
         assert!(!lock_path.exists());
         assert_eq!(
-            fs::read_to_string(&state_path).expect("failed to read repaired timestamp"),
-            "1000000000"
+            fs::read_to_string(&state_path).expect("failed to read repaired token"),
+            "7:1"
         );
 
-        clock.advance(TICK);
         assert_eq!(lease.publish(|| published.set(true)), SinkAction::Published);
         assert!(published.get());
     }
 
     #[test]
-    fn shared_lease_repairs_a_partial_timestamp_before_publishing() {
-        let directory = TestDirectory::new("partial-timestamp");
-        let state_path = directory.state_path();
-        fs::write(&state_path, "partial").expect("failed to write partial timestamp");
-        let clock = TestMonotonicClock::new(5_000_000_000);
-        let lease = SharedPublicationLease::new(TICK, state_path.clone(), clock.clone());
-        let published = Cell::new(false);
+    fn shared_lease_repairs_legacy_or_partial_state_before_publishing() {
+        for (label, stored, nonce) in [
+            ("legacy-state", "1750000000000000000", 9),
+            ("partial-state", "partial", 10),
+        ] {
+            let directory = TestDirectory::new(label);
+            let state_path = directory.state_path();
+            fs::write(&state_path, stored).expect("failed to write invalid state");
+            let mut lease = SharedPublicationLease::new(TICK, state_path.clone(), nonce);
+            let published = Cell::new(false);
 
-        assert_eq!(
-            lease.publish(|| published.set(true)),
-            SinkAction::Retry(TICK)
-        );
-        assert!(!published.get());
-        assert_eq!(
-            fs::read_to_string(&state_path).expect("failed to read repaired timestamp"),
-            "5000000000"
-        );
+            assert_eq!(
+                lease.publish(|| published.set(true)),
+                SinkAction::Retry(TICK)
+            );
+            assert!(!published.get());
+            assert_eq!(
+                fs::read_to_string(&state_path).expect("failed to read repaired token"),
+                format!("{nonce}:1")
+            );
 
-        clock.advance(TICK);
-        assert_eq!(lease.publish(|| published.set(true)), SinkAction::Published);
-        assert!(published.get());
+            assert_eq!(lease.publish(|| published.set(true)), SinkAction::Published);
+            assert!(published.get());
+        }
     }
 
     const ROUTE: &str = "\
