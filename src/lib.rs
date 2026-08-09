@@ -76,6 +76,37 @@ impl SampleTicker {
     }
 }
 
+#[derive(Debug)]
+pub struct RetryTimer {
+    interval: Duration,
+    deadline: Option<Instant>,
+}
+
+impl RetryTimer {
+    pub fn new(interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "retry interval must be non-zero");
+        Self {
+            interval,
+            deadline: None,
+        }
+    }
+
+    pub fn arm(&mut self, now: Instant) -> Duration {
+        self.deadline = Some(now + self.interval);
+        self.interval
+    }
+
+    pub fn on_timer(&mut self, now: Instant) -> bool {
+        match self.deadline {
+            Some(deadline) if now >= deadline => {
+                self.deadline = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WidgetValues {
     pub netspeed: String,
@@ -289,29 +320,7 @@ pub fn publication_completion_nonce(
 }
 
 pub fn instance_nonce_from_random(random: [u8; 16]) -> u128 {
-    u128::from_le_bytes(random) & (u128::MAX >> 1)
-}
-
-/// Allocate a collision-free nonce when the WASI random source is unavailable.
-/// Calls for one path must be serialized by Zellij's per-plugin FIFO executor.
-pub fn next_fallback_instance_nonce(state_path: &Path) -> io::Result<u128> {
-    const FALLBACK_NAMESPACE: u128 = 1 << 127;
-    let current = match fs::read_to_string(state_path) {
-        Ok(value) => value
-            .trim()
-            .parse::<u128>()
-            .ok()
-            .filter(|value| *value < FALLBACK_NAMESPACE)
-            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid nonce counter"))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => 0,
-        Err(error) => return Err(error),
-    };
-    let next = current
-        .checked_add(1)
-        .filter(|value| *value < FALLBACK_NAMESPACE)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "nonce counter exhausted"))?;
-    atomic_replace(state_path, &next.to_string())?;
-    Ok(FALLBACK_NAMESPACE | next)
+    u128::from_le_bytes(random)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +343,13 @@ impl PublicationToken {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedPublication {
+    Unobserved,
+    Missing,
+    Token(PublicationToken),
+}
+
 /// Cross-instance publication gate for Zellij's per-plugin FIFO executor.
 ///
 /// Calls for one state path must be externally serialized. This lets a later
@@ -342,7 +358,7 @@ pub struct SharedPublicationLease {
     interval: Duration,
     instance_nonce: u128,
     next_generation: u64,
-    observed_token: Option<PublicationToken>,
+    observed_publication: ObservedPublication,
     state_path: PathBuf,
     lock_path: PathBuf,
 }
@@ -355,7 +371,7 @@ impl SharedPublicationLease {
             interval,
             instance_nonce,
             next_generation: 0,
-            observed_token: None,
+            observed_publication: ObservedPublication::Unobserved,
             state_path,
             lock_path,
         }
@@ -377,14 +393,15 @@ impl SharedPublicationLease {
                 let Some(token) = PublicationToken::parse(&value) else {
                     return self.repair_state(&mut lock);
                 };
-                if self.observed_token != Some(token) {
-                    self.observed_token = Some(token);
+                if self.observed_publication != ObservedPublication::Token(token) {
+                    self.observed_publication = ObservedPublication::Token(token);
                     lock.remove_on_drop = true;
                     return SinkAction::Retry(self.interval);
                 }
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                if self.observed_token.take().is_some() {
+                if self.observed_publication != ObservedPublication::Missing {
+                    self.observed_publication = ObservedPublication::Missing;
                     lock.remove_on_drop = true;
                     return SinkAction::Retry(self.interval);
                 }
@@ -398,7 +415,7 @@ impl SharedPublicationLease {
         let token = self.next_token();
         publish();
         if self.write_token(token).is_ok() {
-            self.observed_token = Some(token);
+            self.observed_publication = ObservedPublication::Token(token);
             lock.remove_on_drop = true;
         }
         SinkAction::Published
@@ -412,7 +429,7 @@ impl SharedPublicationLease {
         if self.write_token(token).is_err() {
             return SinkAction::Retry(self.interval);
         }
-        self.observed_token = Some(token);
+        self.observed_publication = ObservedPublication::Token(token);
         if remove_lock_path(&self.lock_path).is_err() {
             return SinkAction::Retry(self.interval);
         }
@@ -422,7 +439,7 @@ impl SharedPublicationLease {
     fn repair_state(&mut self, lock: &mut LeaseLock) -> SinkAction {
         let token = self.next_token();
         if self.write_token(token).is_ok() {
-            self.observed_token = Some(token);
+            self.observed_publication = ObservedPublication::Token(token);
             lock.remove_on_drop = true;
         }
         SinkAction::Retry(self.interval)
@@ -900,6 +917,21 @@ mod tests {
     }
 
     #[test]
+    fn retry_timer_ignores_early_and_duplicate_events() {
+        let now = Instant::now();
+        let mut retry = RetryTimer::new(TICK);
+
+        assert_eq!(retry.arm(now), TICK);
+        assert!(!retry.on_timer(now + Duration::from_secs(1)));
+        assert!(retry.on_timer(now + TICK));
+        assert!(!retry.on_timer(now + TICK));
+
+        assert_eq!(retry.arm(now + TICK), TICK);
+        assert!(!retry.on_timer(now + Duration::from_secs(3)));
+        assert!(retry.on_timer(now + TICK + TICK));
+    }
+
+    #[test]
     fn ticker_anchors_next_cycle_after_current_work() {
         let now = Instant::now();
         let mut ticker = ticker();
@@ -1193,23 +1225,33 @@ mod tests {
     }
 
     #[test]
-    fn random_and_fallback_nonces_use_disjoint_namespaces() {
+    fn random_nonce_preserves_all_entropy_bits() {
         let random = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
         assert_eq!(
             instance_nonce_from_random(random),
-            0x7feeddccbbaa99887766554433221100
+            0xffeeddccbbaa99887766554433221100
         );
+    }
 
-        let directory = TestDirectory::new("nonce-counter");
-        let state_path = directory.0.join("nonce");
-        let first = next_fallback_instance_nonce(&state_path).expect("first fallback nonce failed");
-        let second =
-            next_fallback_instance_nonce(&state_path).expect("second fallback nonce failed");
-        assert_eq!(first, (1 << 127) | 1);
-        assert_eq!(second, (1 << 127) | 2);
+    #[test]
+    fn shared_lease_waits_after_first_observing_missing_state() {
+        let directory = TestDirectory::new("missing-shared-state");
+        let mut lease = SharedPublicationLease::new(TICK, directory.state_path(), 11);
+        let publications = Cell::new(0);
+
+        assert_eq!(
+            lease.publish(|| publications.set(publications.get() + 1)),
+            SinkAction::Retry(TICK)
+        );
+        assert_eq!(publications.get(), 0);
+        assert_eq!(
+            lease.publish(|| publications.set(publications.get() + 1)),
+            SinkAction::Published
+        );
+        assert_eq!(publications.get(), 1);
     }
 
     #[test]
@@ -1221,6 +1263,11 @@ mod tests {
         let publications = Rc::new(Cell::new(0));
 
         let first_publications = publications.clone();
+        assert_eq!(
+            first.publish(|| first_publications.set(first_publications.get() + 1)),
+            SinkAction::Retry(TICK)
+        );
+        assert_eq!(publications.get(), 0);
         assert_eq!(
             first.publish(|| first_publications.set(first_publications.get() + 1)),
             SinkAction::Published
@@ -1272,6 +1319,9 @@ mod tests {
             },
         );
         assert_eq!(old.submit(values("old")), BroadcasterAction::Schedule(TICK));
+        old_clock.advance(TICK);
+        assert_eq!(old.on_timer(), BroadcasterAction::Schedule(TICK));
+        assert_eq!(publications.get(), 0);
         old_clock.advance(TICK);
         assert_eq!(old.on_timer(), BroadcasterAction::Published);
 

@@ -7,10 +7,10 @@ use zellij_tile::prelude::*;
 
 use zj_sysinfo::{
     default_iface, fallback_iface, format_speed, iface_bytes, instance_nonce_from_random,
-    is_active_client, loadavg, next_fallback_instance_nonce, parse_macos_probe, probe_context,
-    probe_token_from_context, publication_completion_nonce, rate, AsyncProbe, BroadcasterAction,
-    ProbeAction, ProbeToken, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction,
-    SystemClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
+    is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
+    publication_completion_nonce, rate, AsyncProbe, BroadcasterAction, ProbeAction, ProbeToken,
+    RetryTimer, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
+    TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
 
 const INTERVAL: Duration = Duration::from_secs(2);
@@ -33,8 +33,24 @@ enum HostMode {
 }
 
 #[derive(Default)]
-struct State {
-    runtime: Option<Runtime>,
+enum State {
+    #[default]
+    Dormant,
+    Active(Box<ActivePlugin>),
+}
+
+struct ActivePlugin {
+    permission_granted: bool,
+    publisher: PublisherState,
+}
+
+enum PublisherState {
+    Initializing {
+        plugin_id: u32,
+        zellij_pid: u32,
+        retry: RetryTimer,
+    },
+    Running(Box<Runtime>),
 }
 
 struct Runtime {
@@ -51,7 +67,7 @@ struct Runtime {
 
 impl Runtime {
     fn new(plugin_id: u32, zellij_pid: u32) -> io::Result<Self> {
-        let instance_nonce = instance_nonce(plugin_id, zellij_pid)?;
+        let instance_nonce = instance_nonce()?;
         Ok(Self {
             granted: false,
             plugin_id,
@@ -90,14 +106,7 @@ impl ZellijPlugin for State {
         if !is_active_client(ids.client_id) {
             return;
         }
-        let runtime = match Runtime::new(ids.plugin_id, ids.zellij_pid) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                eprintln!("zj-sysinfo: failed to allocate an instance nonce: {error}");
-                return;
-            }
-        };
-        self.runtime = Some(runtime);
+        *self = Self::Active(Box::new(ActivePlugin::new(ids.plugin_id, ids.zellij_pid)));
         request_permission(&[
             PermissionType::FullHdAccess,
             PermissionType::MessageAndLaunchOtherPlugins,
@@ -108,31 +117,70 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
         ]);
+        if let Self::Active(active) = self {
+            active.try_initialize();
+        }
     }
 
     fn update(&mut self, event: Event) -> bool {
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.update(event);
+        if let Self::Active(active) = self {
+            active.update(event);
         }
         false // background plugin: nothing to render
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
-        if let Some(runtime) = self.runtime.as_mut() {
-            runtime.handle_pipe(message);
+        if let Self::Active(active) = self {
+            active.handle_pipe(message);
         }
         false
     }
 }
 
-impl Runtime {
+impl ActivePlugin {
+    fn new(plugin_id: u32, zellij_pid: u32) -> Self {
+        Self {
+            permission_granted: false,
+            publisher: PublisherState::Initializing {
+                plugin_id,
+                zellij_pid,
+                retry: RetryTimer::new(INTERVAL),
+            },
+        }
+    }
+
+    fn try_initialize(&mut self) {
+        let (plugin_id, zellij_pid) = match &self.publisher {
+            PublisherState::Initializing {
+                plugin_id,
+                zellij_pid,
+                ..
+            } => (*plugin_id, *zellij_pid),
+            PublisherState::Running(_) => return,
+        };
+        match Runtime::new(plugin_id, zellij_pid) {
+            Ok(mut runtime) => {
+                if self.permission_granted {
+                    runtime.grant_permissions();
+                }
+                self.publisher = PublisherState::Running(Box::new(runtime));
+            }
+            Err(error) => {
+                eprintln!("zj-sysinfo: failed to allocate an instance nonce: {error}");
+                let PublisherState::Initializing { retry, .. } = &mut self.publisher else {
+                    unreachable!("publisher changed while initializing");
+                };
+                schedule_timer(retry.arm(Instant::now()));
+            }
+        }
+    }
+
     fn update(&mut self, event: Event) {
         match event {
-            Event::PermissionRequestResult(PermissionStatus::Granted) if !self.granted => {
-                self.granted = true;
-                change_host_folder(PathBuf::from("/"));
-                if let Some(delay) = self.ticker.start(Instant::now()) {
-                    schedule_timer(delay);
+            Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                self.permission_granted = true;
+                if let PublisherState::Running(runtime) = &mut self.publisher {
+                    runtime.grant_permissions();
                 }
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
@@ -146,6 +194,47 @@ impl Runtime {
                     PermissionType::RunCommands,
                 ]);
             }
+            timer_event @ Event::Timer(_) => {
+                let should_initialize = match &mut self.publisher {
+                    PublisherState::Initializing { retry, .. } => retry.on_timer(Instant::now()),
+                    PublisherState::Running(runtime) => {
+                        runtime.update(timer_event);
+                        false
+                    }
+                };
+                if should_initialize {
+                    self.try_initialize();
+                }
+            }
+            event => {
+                if let PublisherState::Running(runtime) = &mut self.publisher {
+                    runtime.update(event);
+                }
+            }
+        }
+    }
+
+    fn handle_pipe(&mut self, message: PipeMessage) {
+        if let PublisherState::Running(runtime) = &mut self.publisher {
+            runtime.handle_pipe(message);
+        }
+    }
+}
+
+impl Runtime {
+    fn grant_permissions(&mut self) {
+        if self.granted {
+            return;
+        }
+        self.granted = true;
+        change_host_folder(PathBuf::from("/"));
+        if let Some(delay) = self.ticker.start(Instant::now()) {
+            schedule_timer(delay);
+        }
+    }
+
+    fn update(&mut self, event: Event) {
+        match event {
             Event::Timer(_) if self.granted => {
                 let broadcast_action = self.broadcaster.on_timer();
                 self.handle_broadcaster_action(broadcast_action);
@@ -299,26 +388,11 @@ impl WidgetSink for ZellijSink {
     }
 }
 
-fn instance_nonce(plugin_id: u32, zellij_pid: u32) -> io::Result<u128> {
+fn instance_nonce() -> io::Result<u128> {
     let mut random = [0; 16];
-    match getrandom::getrandom(&mut random) {
-        Ok(()) => Ok(instance_nonce_from_random(random)),
-        Err(random_error) => {
-            eprintln!(
-                "zj-sysinfo: random nonce unavailable ({random_error}); using persistent counter"
-            );
-            let state_path =
-                PathBuf::from(format!("/cache/zj-sysinfo-{zellij_pid}-{plugin_id}.nonce"));
-            next_fallback_instance_nonce(&state_path).map_err(|fallback_error| {
-                io::Error::new(
-                    fallback_error.kind(),
-                    format!(
-                        "random source failed ({random_error}); counter failed ({fallback_error})"
-                    ),
-                )
-            })
-        }
-    }
+    getrandom::getrandom(&mut random)
+        .map_err(|error| io::Error::other(format!("random source failed ({error})")))?;
+    Ok(instance_nonce_from_random(random))
 }
 
 fn schedule_timer(delay: Duration) {
