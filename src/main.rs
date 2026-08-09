@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use zellij_tile::prelude::*;
 
 use zj_sysinfo::{
-    compose_instance_nonce, default_iface, fallback_iface, format_speed, iface_bytes,
+    default_iface, fallback_iface, format_speed, iface_bytes, instance_nonce_from_random,
     is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
     publication_completion_nonce, rate, AsyncProbe, BroadcasterAction, ProbeAction, ProbeToken,
     SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
-    SystemEpochClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
+    SystemMonotonicClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
 
 const INTERVAL: Duration = Duration::from_secs(2);
@@ -49,9 +49,9 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(plugin_id: u32, zellij_pid: u32) -> Self {
-        let instance_nonce = instance_nonce(plugin_id, zellij_pid);
-        Self {
+    fn new(plugin_id: u32, zellij_pid: u32) -> Result<Self, getrandom::Error> {
+        let instance_nonce = instance_nonce()?;
+        Ok(Self {
             granted: false,
             plugin_id,
             instance_nonce,
@@ -67,14 +67,14 @@ impl Runtime {
                         PathBuf::from(format!(
                             "/cache/zj-sysinfo-{zellij_pid}-{plugin_id}.publication"
                         )),
-                        SystemEpochClock,
+                        SystemMonotonicClock,
                     ),
                 },
             ),
             host_mode: HostMode::default(),
             probe: AsyncProbe::new(instance_nonce, MISSED_PROBE_TICKS, MISSED_PROBE_TICKS_MAX),
             prev: None,
-        }
+        })
     }
 }
 
@@ -89,7 +89,14 @@ impl ZellijPlugin for State {
         if !is_active_client(ids.client_id) {
             return;
         }
-        self.runtime = Some(Runtime::new(ids.plugin_id, ids.zellij_pid));
+        let runtime = match Runtime::new(ids.plugin_id, ids.zellij_pid) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("zj-sysinfo: failed to create an instance nonce: {error}");
+                return;
+            }
+        };
+        self.runtime = Some(runtime);
         request_permission(&[
             PermissionType::FullHdAccess,
             PermissionType::MessageAndLaunchOtherPlugins,
@@ -274,7 +281,7 @@ impl Runtime {
 struct ZellijSink {
     plugin_id: u32,
     instance_nonce: u128,
-    lease: SharedPublicationLease<SystemEpochClock>,
+    lease: SharedPublicationLease<SystemMonotonicClock>,
 }
 
 impl WidgetSink for ZellijSink {
@@ -291,12 +298,10 @@ impl WidgetSink for ZellijSink {
     }
 }
 
-fn instance_nonce(plugin_id: u32, zellij_pid: u32) -> u128 {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    compose_instance_nonce(timestamp, plugin_id, zellij_pid)
+fn instance_nonce() -> Result<u128, getrandom::Error> {
+    let mut random = [0; 16];
+    getrandom::getrandom(&mut random)?;
+    Ok(instance_nonce_from_random(random))
 }
 
 fn schedule_timer(delay: Duration) {

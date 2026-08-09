@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const ACTIVE_CLIENT_ID: u16 = 1;
 pub const PROBE_CONTEXT_KEY: &str = "zj-sysinfo";
@@ -128,6 +128,7 @@ pub struct SessionBroadcaster<C, S> {
     startup_not_before: Instant,
     external_not_before: Option<Instant>,
     last_completed: Option<Instant>,
+    sink_retry_not_before: Option<Instant>,
     pending: Option<WidgetValues>,
     timer_deadline: Option<Instant>,
 }
@@ -147,6 +148,7 @@ where
             startup_not_before,
             external_not_before: None,
             last_completed: None,
+            sink_retry_not_before: None,
             pending: None,
             timer_deadline: None,
         }
@@ -202,13 +204,23 @@ where
         match self.sink.publish(&values) {
             SinkAction::Published => {
                 self.last_completed = Some(self.clock.now());
+                self.sink_retry_not_before = None;
                 BroadcasterAction::Published
             }
             SinkAction::Retry(delay) => {
                 assert!(!delay.is_zero(), "publication retry must be non-zero");
                 self.pending = Some(values);
-                self.timer_deadline = Some(self.clock.now() + delay);
-                BroadcasterAction::Schedule(delay)
+                let now = self.clock.now();
+                let retry_not_before = now + delay;
+                self.sink_retry_not_before = Some(
+                    self.sink_retry_not_before
+                        .map_or(retry_not_before, |current| current.max(retry_not_before)),
+                );
+                let retry_not_before = self
+                    .sink_retry_not_before
+                    .expect("publication retry deadline disappeared");
+                self.timer_deadline = Some(retry_not_before);
+                BroadcasterAction::Schedule(retry_not_before.saturating_duration_since(now))
             }
         }
     }
@@ -220,6 +232,9 @@ where
         }
         if let Some(last_completed) = self.last_completed {
             due = due.max(last_completed + self.interval);
+        }
+        if let Some(sink_retry_not_before) = self.sink_retry_not_before {
+            due = due.max(sink_retry_not_before);
         }
         due
     }
@@ -273,26 +288,44 @@ pub fn publication_completion_nonce(
     payload?.parse().ok()
 }
 
-pub fn compose_instance_nonce(timestamp_nanos: u128, plugin_id: u32, zellij_pid: u32) -> u128 {
-    timestamp_nanos ^ (u128::from(zellij_pid) << 64) ^ u128::from(plugin_id)
+pub fn instance_nonce_from_random(random: [u8; 16]) -> u128 {
+    u128::from_le_bytes(random)
 }
 
-pub trait EpochClock {
-    fn now_nanos(&self) -> u128;
+/// Process-wide monotonic nanoseconds. Values must be comparable across every
+/// WASM instance that shares a publication lease.
+pub trait MonotonicClock {
+    fn now_nanos(&self) -> Option<u128>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SystemEpochClock;
+pub struct SystemMonotonicClock;
 
-impl EpochClock for SystemEpochClock {
-    fn now_nanos(&self) -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
+#[cfg(target_os = "wasi")]
+impl MonotonicClock for SystemMonotonicClock {
+    fn now_nanos(&self) -> Option<u128> {
+        // The WASI host exposes one monotonic clock to every instance in the
+        // Zellij process, so persisted values remain comparable on handover.
+        unsafe { wasi::clock_time_get(wasi::CLOCKID_MONOTONIC, 1) }
+            .ok()
+            .map(u128::from)
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
+impl MonotonicClock for SystemMonotonicClock {
+    fn now_nanos(&self) -> Option<u128> {
+        use std::sync::OnceLock;
+
+        static START: OnceLock<Instant> = OnceLock::new();
+        Some(START.get_or_init(Instant::now).elapsed().as_nanos())
+    }
+}
+
+/// Cross-instance publication gate for Zellij's per-plugin FIFO executor.
+///
+/// Calls for one state path must be externally serialized. This lets a later
+/// call treat an existing lock marker as abandoned rather than in flight.
 pub struct SharedPublicationLease<C> {
     interval: Duration,
     clock: C,
@@ -302,7 +335,7 @@ pub struct SharedPublicationLease<C> {
 
 impl<C> SharedPublicationLease<C>
 where
-    C: EpochClock,
+    C: MonotonicClock,
 {
     pub fn new(interval: Duration, state_path: PathBuf, clock: C) -> Self {
         assert!(!interval.is_zero(), "lease interval must be non-zero");
@@ -319,56 +352,102 @@ where
     where
         F: FnOnce(),
     {
-        if fs::create_dir(&self.lock_path).is_err() {
+        let mut lock = match fs::create_dir(&self.lock_path) {
+            Ok(()) => LeaseLock::new(self.lock_path.clone()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return self.recover_abandoned_lock();
+            }
+            Err(_) => return SinkAction::Retry(self.interval),
+        };
+        let Some(now) = self.clock.now_nanos() else {
+            lock.remove_on_drop = true;
             return SinkAction::Retry(self.interval);
-        }
-        let mut lock = LeaseLock::new(self.lock_path.clone());
-        let now = self.clock.now_nanos();
+        };
         let last_completed = match fs::read_to_string(&self.timestamp_path) {
             Ok(timestamp) => match timestamp.trim().parse::<u128>() {
                 Ok(timestamp) => Some(timestamp),
-                Err(_) => return SinkAction::Retry(self.interval),
+                Err(_) => return self.repair_timestamp(&mut lock, now),
             },
             Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(_) => return SinkAction::Retry(self.interval),
+            Err(_) => {
+                lock.remove_on_drop = true;
+                return SinkAction::Retry(self.interval);
+            }
         };
         if let Some(last_completed) = last_completed {
             let due = last_completed.saturating_add(self.interval.as_nanos());
             if now < due {
+                lock.remove_on_drop = true;
                 return SinkAction::Retry(duration_from_nanos(due - now));
             }
         }
 
         publish();
-        let completed = self.clock.now_nanos();
-        if fs::write(&self.timestamp_path, completed.to_string()).is_err() {
-            // Keep the lock if the timestamp cannot be recorded. Freezing is
-            // safer than allowing a replacement instance to publish early.
-            lock.release_on_drop = false;
+        let Some(completed) = self.clock.now_nanos() else {
+            return SinkAction::Published;
+        };
+        if self.write_timestamp(completed).is_ok() {
+            lock.remove_on_drop = true;
         }
         SinkAction::Published
+    }
+
+    fn recover_abandoned_lock(&self) -> SinkAction {
+        // Zellij 0.44.3 executes every callback and replacement load for one
+        // plugin_id on the same FIFO thread. Observing this marker therefore
+        // proves its callback ended or trapped; it cannot still be publishing.
+        let Some(now) = self.clock.now_nanos() else {
+            return SinkAction::Retry(self.interval);
+        };
+        if self.write_timestamp(now).is_err() {
+            return SinkAction::Retry(self.interval);
+        }
+        if remove_lock_path(&self.lock_path).is_err() {
+            return SinkAction::Retry(self.interval);
+        }
+        SinkAction::Retry(self.interval)
+    }
+
+    fn repair_timestamp(&self, lock: &mut LeaseLock, now: u128) -> SinkAction {
+        if self.write_timestamp(now).is_ok() {
+            lock.remove_on_drop = true;
+        }
+        SinkAction::Retry(self.interval)
+    }
+
+    fn write_timestamp(&self, timestamp: u128) -> io::Result<()> {
+        let temporary_path = self.timestamp_path.with_extension("next");
+        fs::write(&temporary_path, timestamp.to_string())?;
+        fs::rename(temporary_path, &self.timestamp_path)
     }
 }
 
 struct LeaseLock {
     path: PathBuf,
-    release_on_drop: bool,
+    remove_on_drop: bool,
 }
 
 impl LeaseLock {
     fn new(path: PathBuf) -> Self {
         Self {
             path,
-            release_on_drop: true,
+            remove_on_drop: false,
         }
     }
 }
 
 impl Drop for LeaseLock {
     fn drop(&mut self) {
-        if self.release_on_drop {
-            let _ = fs::remove_dir(&self.path);
+        if self.remove_on_drop {
+            let _ = remove_lock_path(&self.path);
         }
+    }
+}
+
+fn remove_lock_path(path: &Path) -> io::Result<()> {
+    match fs::remove_dir(path) {
+        Err(error) if error.kind() == ErrorKind::NotADirectory => fs::remove_file(path),
+        result => result,
     }
 }
 
@@ -671,11 +750,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TestEpochClock {
+    struct TestMonotonicClock {
         now: Rc<Cell<u128>>,
     }
 
-    impl TestEpochClock {
+    impl TestMonotonicClock {
         fn new(now: u128) -> Self {
             Self {
                 now: Rc::new(Cell::new(now)),
@@ -692,9 +771,9 @@ mod tests {
         }
     }
 
-    impl EpochClock for TestEpochClock {
-        fn now_nanos(&self) -> u128 {
-            self.now.get()
+    impl MonotonicClock for TestMonotonicClock {
+        fn now_nanos(&self) -> Option<u128> {
+            Some(self.now.get())
         }
     }
 
@@ -867,10 +946,15 @@ mod tests {
             broadcaster.on_timer(),
             BroadcasterAction::Schedule(Duration::from_millis(100))
         );
+        assert_eq!(
+            broadcaster.submit(values("latest")),
+            BroadcasterAction::None
+        );
+        assert_eq!(broadcaster.sink().attempts, 1);
         clock.advance(Duration::from_millis(100));
         assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
         assert_eq!(broadcaster.sink().attempts, 2);
-        assert_eq!(broadcaster.sink().published, vec![values("pending")]);
+        assert_eq!(broadcaster.sink().published, vec![values("latest")]);
     }
 
     #[test]
@@ -1100,17 +1184,21 @@ mod tests {
     }
 
     #[test]
-    fn instance_nonce_changes_with_each_identity_component() {
-        let nonce = compose_instance_nonce(1, 2, 3);
-        assert_ne!(nonce, compose_instance_nonce(2, 2, 3));
-        assert_ne!(nonce, compose_instance_nonce(1, 3, 3));
-        assert_ne!(nonce, compose_instance_nonce(1, 2, 4));
+    fn instance_nonce_preserves_all_random_bits() {
+        let random = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_eq!(
+            instance_nonce_from_random(random),
+            0xffeeddccbbaa99887766554433221100
+        );
     }
 
     #[test]
     fn shared_lease_serializes_replacement_publications() {
         let directory = TestDirectory::new("shared-lease");
-        let clock = TestEpochClock::new(1_000_000_000);
+        let clock = TestMonotonicClock::new(1_000_000_000);
         let first = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
         let replacement = SharedPublicationLease::new(TICK, directory.state_path(), clock.clone());
         let publications = Rc::new(Cell::new(0));
@@ -1142,12 +1230,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_lease_never_publishes_while_another_instance_holds_the_lock() {
+    fn shared_lease_recovers_an_abandoned_lock_before_publishing() {
         let directory = TestDirectory::new("held-lease");
         let state_path = directory.state_path();
-        fs::create_dir(state_path.with_extension("lock")).expect("failed to hold test lock");
-        let lease =
-            SharedPublicationLease::new(TICK, state_path, TestEpochClock::new(1_000_000_000));
+        let lock_path = state_path.with_extension("lock");
+        fs::create_dir(&lock_path).expect("failed to hold test lock");
+        let clock = TestMonotonicClock::new(1_000_000_000);
+        let lease = SharedPublicationLease::new(TICK, state_path.clone(), clock.clone());
         let published = Cell::new(false);
 
         assert_eq!(
@@ -1155,6 +1244,39 @@ mod tests {
             SinkAction::Retry(TICK)
         );
         assert!(!published.get());
+        assert!(!lock_path.exists());
+        assert_eq!(
+            fs::read_to_string(&state_path).expect("failed to read repaired timestamp"),
+            "1000000000"
+        );
+
+        clock.advance(TICK);
+        assert_eq!(lease.publish(|| published.set(true)), SinkAction::Published);
+        assert!(published.get());
+    }
+
+    #[test]
+    fn shared_lease_repairs_a_partial_timestamp_before_publishing() {
+        let directory = TestDirectory::new("partial-timestamp");
+        let state_path = directory.state_path();
+        fs::write(&state_path, "partial").expect("failed to write partial timestamp");
+        let clock = TestMonotonicClock::new(5_000_000_000);
+        let lease = SharedPublicationLease::new(TICK, state_path.clone(), clock.clone());
+        let published = Cell::new(false);
+
+        assert_eq!(
+            lease.publish(|| published.set(true)),
+            SinkAction::Retry(TICK)
+        );
+        assert!(!published.get());
+        assert_eq!(
+            fs::read_to_string(&state_path).expect("failed to read repaired timestamp"),
+            "5000000000"
+        );
+
+        clock.advance(TICK);
+        assert_eq!(lease.publish(|| published.set(true)), SinkAction::Published);
+        assert!(published.get());
     }
 
     const ROUTE: &str = "\
