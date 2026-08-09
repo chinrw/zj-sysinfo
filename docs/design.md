@@ -18,11 +18,11 @@ The connected copy with the lowest client ID is the only sampler and
 broadcaster. Connected followers poll every 2 seconds for handover. A copy
 missing from the pane-derived client snapshot stops sampling immediately
 but keeps retrying at 2, 4, 8, 16, then 30-second intervals; snapshot
-absence is not an authoritative disconnect signal. Sampling deadlines are
-anchored to the completed snapshot, so variable response latency cannot
-compress the publication interval below 2 seconds. A deadline gate also
-collapses stale timer events. This requires the additional
-`ReadApplicationState` permission.
+absence is not an authoritative disconnect signal. The next sampling
+deadline is armed only after the current sampling attempt returns, so
+snapshot and synchronous publication latency cannot compress the next
+launch below 2 seconds. A deadline gate also collapses stale timer events.
+This requires the additional `ReadApplicationState` permission.
 
 ## Problem
 

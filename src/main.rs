@@ -52,7 +52,7 @@ impl Default for State {
         Self {
             granted: false,
             client_id: None,
-            ticker: SessionTicker::default(),
+            ticker: SessionTicker::new(INTERVAL),
             is_publisher: false,
             host_mode: HostMode::default(),
             probe_in_flight: false,
@@ -115,7 +115,6 @@ impl ZellijPlugin for State {
                 };
                 let action = self.ticker.on_clients(
                     Instant::now(),
-                    INTERVAL,
                     client_id,
                     clients.into_iter().map(|client| client.client_id),
                 );
@@ -140,10 +139,11 @@ impl State {
                 self.deactivate_publisher();
                 schedule_timer(delay);
             }
-            ClientAction::PublishAndSchedule(delay) => {
+            ClientAction::Sample => {
                 self.is_publisher = true;
-                schedule_timer(delay);
                 self.tick();
+                let delay = self.ticker.on_sampled(Instant::now());
+                schedule_timer(delay);
             }
         }
     }
