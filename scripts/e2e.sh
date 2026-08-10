@@ -189,6 +189,18 @@ if [ -z "$found" ]; then
   # cannot distinguish a silent plugin from a session that never started.
   # Unfiltered on purpose -- a filter that guesses wrong prints nothing and
   # costs another CI round trip.
+  # config.kdl being honored while the layout is not would mean the fixtures
+  # are fine and the invocation is not, so print both plus the command.
+  printf '\ne2e: --- invocation ---\n' >&2
+  printf 'SHELL=%s\n' "${SHELL:-<unset>}" >&2
+  printf '%s --config %s --session %s --new-session-with-layout %s\n' \
+    "$ZELLIJ_BIN" "$WORK/config.kdl" "$SESSION" "$WORK/layout.kdl" >&2
+  ls -la "$WORK" >&2 2>/dev/null || true
+  printf '\ne2e: --- config.kdl ---\n' >&2
+  cat "$WORK/config.kdl" >&2 2>/dev/null || true
+  printf '\ne2e: --- layout.kdl ---\n' >&2
+  cat "$WORK/layout.kdl" >&2 2>/dev/null || true
+
   log="$WORK/zellij-$(id -u)/zellij-log/zellij.log"
   if [ -f "$log" ]; then
     printf '\ne2e: --- zellij.log (tail) ---\n' >&2
