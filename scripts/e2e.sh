@@ -128,12 +128,21 @@ EOF
 # reads a stale file and only sees the rendered values once the process exits,
 # which makes the whole test a coin flip.
 #
+# The config dir has to exist even though --config points elsewhere: without
+# it zellij silently ignores --new-session-with-layout and starts its default
+# layout, so the bar under test is never created and the run is
+# indistinguishable from a plugin that published nothing. Only its existence
+# matters; nothing is written there.
+mkdir -p "$WORK/config/zellij"
+
 # zellij refuses to start without a tty, and its socket (TMPDIR), permission
-# cache (XDG_CACHE_HOME) and data dir (XDG_DATA_HOME) must not touch a
-# developer's live session. Isolating the data dir also makes every run a
-# first run, so a developer's machine behaves like CI's clean HOME instead of
-# hiding first-run-only screens.
+# cache (XDG_CACHE_HOME), data dir (XDG_DATA_HOME) and config dir
+# (XDG_CONFIG_HOME) must not touch a developer's live session -- otherwise the
+# test inherits their layouts and themes, and a clean CI checkout behaves
+# differently from every developer machine. Isolating the data dir also makes
+# every run a first run, so first-run-only screens cannot hide locally.
 TMPDIR="$WORK" XDG_CACHE_HOME="$WORK/cache" XDG_DATA_HOME="$WORK/data" \
+  XDG_CONFIG_HOME="$WORK/config" \
   script -qfc "'$ZELLIJ_BIN' --config '$WORK/config.kdl' --session '$SESSION' --new-session-with-layout '$WORK/layout.kdl'" \
   "$WORK/screen.raw" >/dev/null 2>&1 &
 zellij_pty=$!
