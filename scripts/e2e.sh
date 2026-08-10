@@ -148,8 +148,15 @@ traffic=$!
 
 last=""
 found=""
+died=""
 for _ in $(seq 1 $((DEADLINE_SECS * 4))); do
   sleep 0.25
+  # A session that exits early is a different failure from a silent plugin,
+  # and waiting out the deadline for it just delays the same diagnosis.
+  if ! kill -0 "$zellij_pty" 2>/dev/null; then
+    died=1
+    break
+  fi
   [ -f "$WORK/screen.raw" ] || continue
   # Strip CSI and OSC sequences before matching.
   rendered="$(sed -e 's/\x1b\[[0-9;?]*[ -/]*[@-~]//g' -e 's/\x1b\][^\x07\x1b]*\(\x07\|\x1b\\\)//g' \
@@ -169,6 +176,9 @@ kill "$zellij_pty" "$traffic" 2>/dev/null || true
 wait "$zellij_pty" "$traffic" 2>/dev/null || true
 
 if [ -z "$found" ]; then
+  if [ -n "$died" ]; then
+    printf 'e2e: the zellij session exited before producing a sample\n' >&2
+  fi
   printf 'e2e: no live sample within %ss\n' "$DEADLINE_SECS" >&2
   printf 'e2e: last rendered: %s\n' "${last:-<nothing>}" >&2
   printf 'e2e: an empty widget means the plugin published nothing at all;\n' >&2
@@ -177,16 +187,26 @@ if [ -z "$found" ]; then
   printf 'e2e: permission failure, which looks identical from the outside).\n' >&2
   # Without these a CI failure is undiagnosable: the screen capture alone
   # cannot distinguish a silent plugin from a session that never started.
+  # Unfiltered on purpose -- a filter that guesses wrong prints nothing and
+  # costs another CI round trip.
   log="$WORK/zellij-$(id -u)/zellij-log/zellij.log"
   if [ -f "$log" ]; then
-    printf '\ne2e: --- zellij.log (plugin lines) ---\n' >&2
-    grep -iE 'plugin|permission|error|panic' "$log" | tail -30 >&2
+    printf '\ne2e: --- zellij.log (tail) ---\n' >&2
+    tail -40 "$log" >&2
   else
-    printf '\ne2e: no zellij log at %s -- the session never started\n' "$log" >&2
+    printf '\ne2e: no zellij log at %s\n' "$log" >&2
+    ls -la "$WORK" >&2 2>/dev/null || true
   fi
-  printf '\ne2e: --- captured screen (last 400 bytes, escapes stripped) ---\n' >&2
-  sed -e 's/\x1b\[[0-9;?]*[ -/]*[@-~]//g' -e 's/\x1b\][^\x07\x1b]*\(\x07\|\x1b\\\)//g' \
-      "$WORK/screen.raw" 2>/dev/null | tr -d '\r' | tail -c 400 >&2
+  strip() {
+    sed -e 's/\x1b\[[0-9;?]*[ -/]*[@-~]//g' -e 's/\x1b\][^\x07\x1b]*\(\x07\|\x1b\\\)//g' \
+        "$WORK/screen.raw" 2>/dev/null | tr -d '\r'
+  }
+  # The head matters as much as the tail: a config or startup error is printed
+  # once, at the top, and then scrolled away by the redraw.
+  printf '\ne2e: --- captured screen (first 1200 bytes) ---\n' >&2
+  strip | head -c 1200 >&2
+  printf '\ne2e: --- captured screen (last 400 bytes) ---\n' >&2
+  strip | tail -c 400 >&2
   printf '\n' >&2
   exit 1
 fi
