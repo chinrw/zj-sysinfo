@@ -89,7 +89,12 @@ cat >"$WORK/cache/zellij/permissions.kdl" <<EOF
 }
 EOF
 
+# show_release_notes: on a HOME that has never run this version, zellij opens
+# a "welcome to Zellij" screen over the layout, so the bar never renders and
+# the run looks exactly like a silent plugin. A developer's machine hides this
+# because its data dir already records the version -- CI's does not.
 cat >"$WORK/config.kdl" <<EOF
+show_release_notes false
 load_plugins {
     "file:$ZJ_SYSINFO_WASM"
 }
@@ -119,10 +124,17 @@ layout {
 }
 EOF
 
-# zellij refuses to start without a tty, and its socket (TMPDIR) and permission
-# cache (XDG_CACHE_HOME) must not touch a developer's live session.
-TMPDIR="$WORK" XDG_CACHE_HOME="$WORK/cache" \
-  script -qc "'$ZELLIJ_BIN' --config '$WORK/config.kdl' --session '$SESSION' --new-session-with-layout '$WORK/layout.kdl'" \
+# -f flushes the capture after every write. Without it the poll loop below
+# reads a stale file and only sees the rendered values once the process exits,
+# which makes the whole test a coin flip.
+#
+# zellij refuses to start without a tty, and its socket (TMPDIR), permission
+# cache (XDG_CACHE_HOME) and data dir (XDG_DATA_HOME) must not touch a
+# developer's live session. Isolating the data dir also makes every run a
+# first run, so a developer's machine behaves like CI's clean HOME instead of
+# hiding first-run-only screens.
+TMPDIR="$WORK" XDG_CACHE_HOME="$WORK/cache" XDG_DATA_HOME="$WORK/data" \
+  script -qfc "'$ZELLIJ_BIN' --config '$WORK/config.kdl' --session '$SESSION' --new-session-with-layout '$WORK/layout.kdl'" \
   "$WORK/screen.raw" >/dev/null 2>&1 &
 zellij_pty=$!
 
