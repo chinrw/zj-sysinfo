@@ -803,6 +803,17 @@ pub fn parse_macos_probe(stdout: &str) -> Option<MacosProbe> {
     Some(MacosProbe { counters, loadavg })
 }
 
+/// Seconds between two samples, or `None` when they cannot be compared.
+///
+/// A rebuilt WASI context restarts CLOCK_MONOTONIC, so `now` can predate the
+/// previous sample. Saturating that to zero would hand [`rate`] an empty
+/// window, and an empty window answers `0.0` -- a confident "no traffic" for a
+/// speed nobody measured. The caller must render `-` instead.
+pub fn sample_window(previous: Instant, now: Instant) -> Option<f64> {
+    let elapsed = now.checked_duration_since(previous)?;
+    (!elapsed.is_zero()).then(|| elapsed.as_secs_f64())
+}
+
 /// Bytes/second between two counter samples. Wraps and zero intervals → 0.
 pub fn rate(prev: u64, cur: u64, elapsed_secs: f64) -> f64 {
     if elapsed_secs <= 0.0 || cur < prev {
@@ -1767,6 +1778,26 @@ bridge1234 1500  <Link#20>   12:b9:24:5c:29:6c      7     0        700       9  
     #[test]
     fn rate_zero_elapsed_is_zero() {
         assert_eq!(rate(1000, 3000, 0.0), 0.0);
+    }
+
+    /// A restarted CLOCK_MONOTONIC can date the current sample before the
+    /// previous one. `rate` answers 0.0 for an empty window, so the window has
+    /// to be rejected here or the widget claims an authoritative "0 B/s".
+    #[test]
+    fn sample_window_rejects_incomparable_samples() {
+        let now = Instant::now();
+
+        assert_eq!(sample_window(now, now + TICK), Some(TICK.as_secs_f64()));
+        assert_eq!(
+            sample_window(now + TICK, now),
+            None,
+            "clock went backwards: the samples are incomparable"
+        );
+        assert_eq!(
+            sample_window(now, now),
+            None,
+            "an empty window carries no rate information"
+        );
     }
 
     #[test]

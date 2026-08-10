@@ -8,7 +8,8 @@ use zellij_tile::prelude::*;
 use zj_sysinfo::{
     default_iface, fallback_iface, format_speed, iface_bytes, instance_nonce_from_random,
     is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
-    publication_completion_nonce, rate, AsyncProbe, BroadcasterAction, ProbeAction, ProbeToken,
+    publication_completion_nonce, rate, sample_window, AsyncProbe, BroadcasterAction, ProbeAction,
+    ProbeToken,
     RetryTimer, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
     TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
@@ -320,20 +321,13 @@ impl Runtime {
         // if there were no previous sample at all.
         let text = match &self.prev {
             Some((prev_iface, at, prev_rx, prev_tx)) if *prev_iface == iface => {
-                // checked_ rather than saturating: a rebuilt WASI context
-                // restarts CLOCK_MONOTONIC, so `now` can predate the previous
-                // sample. A saturating zero would feed rate() an empty window
-                // and report a confident "0 B/s" for an unknown speed.
-                match now.checked_duration_since(*at) {
-                    Some(elapsed) if !elapsed.is_zero() => {
-                        let elapsed = elapsed.as_secs_f64();
-                        format!(
-                            "D: {} U: {}",
-                            format_speed(rate(*prev_rx, rx, elapsed)),
-                            format_speed(rate(*prev_tx, tx, elapsed)),
-                        )
-                    }
-                    _ => "-".to_string(),
+                match sample_window(*at, now) {
+                    Some(elapsed) => format!(
+                        "D: {} U: {}",
+                        format_speed(rate(*prev_rx, rx, elapsed)),
+                        format_speed(rate(*prev_tx, tx, elapsed)),
+                    ),
+                    None => "-".to_string(),
                 }
             }
             _ => "-".to_string(),
