@@ -34,3 +34,38 @@ jobs:
         with:
           name: zj-sysinfo.wasm
           path: target/wasm32-wasip1/release/zj-sysinfo.wasm
+
+  # The unit tests cannot reach the failure mode that motivated this job: the
+  # plugin's cadence depends on zellij rebuilding its WASI context, and the
+  # widgets depend on zjstatus's pipe protocol. Both only exist at runtime.
+  # Linux only -- the harness needs util-linux `script` for a pty.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - name: Install native test deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      # Pinned: the plugin is written against these internals (WASI context
+      # rebuild, permission cache format). scripts/e2e.sh asserts the version
+      # so an unnoticed bump fails loudly instead of testing something else.
+      - name: Install zellij
+        env:
+          ZELLIJ_VERSION: v0.44.3
+        run: |
+          curl -fsSL "https://github.com/zellij-org/zellij/releases/download/${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          zellij --version
+      - name: Install zjstatus
+        env:
+          ZJSTATUS_VERSION: v0.24.0
+        run: |
+          mkdir -p "$HOME/.config/zellij-plugins"
+          curl -fsSL -o "$HOME/.config/zellij-plugins/zjstatus.wasm" \
+            "https://github.com/dj95/zjstatus/releases/download/${ZJSTATUS_VERSION}/zjstatus.wasm"
+      - name: Build wasm plugin
+        run: cargo build --release --locked --target wasm32-wasip1
+      - name: End-to-end smoke test
+        run: scripts/e2e.sh

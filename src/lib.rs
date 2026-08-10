@@ -21,17 +21,35 @@ pub enum TimerAction {
     RunCycle,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TickerPhase {
     Idle,
-    TimerArmed(Instant),
+    Armed,
     CyclePending,
 }
 
+/// Cadence driver for the sampling loop.
+///
+/// It never reads a clock. Zellij rebuilds the plugin's WASI context on
+/// `change_host_folder`, which restarts CLOCK_MONOTONIC at zero, so an
+/// `Instant` captured before the swap sits permanently in the future of the
+/// clock that comes after it. Comparing a stored deadline against `now` made
+/// `on_timer` answer `Ignore` forever; because `set_timeout` is one-shot and
+/// the `Ignore` path armed no replacement, the plugin went silent for the rest
+/// of the session with no way back.
+///
+/// Instead every `set_timeout` is counted. A timer event is by definition one
+/// of ours coming due, so the cycle runs on arrival and a replacement is armed
+/// only when no other scheduled timer is still outstanding, which is what
+/// collapses redundant schedules.
+///
+/// Invariant: a non-idle ticker always has at least one outstanding timer.
+/// Violating it is the deadlock described above.
 #[derive(Debug)]
 pub struct SampleTicker {
     interval: Duration,
     phase: TickerPhase,
+    outstanding: u32,
 }
 
 impl SampleTicker {
@@ -40,20 +58,30 @@ impl SampleTicker {
         Self {
             interval,
             phase: TickerPhase::Idle,
+            outstanding: 0,
         }
     }
 
-    pub fn start(&mut self, now: Instant) -> Option<Duration> {
+    pub fn start(&mut self) -> Option<Duration> {
         if !matches!(self.phase, TickerPhase::Idle) {
             return None;
         }
-        self.phase = TickerPhase::TimerArmed(now);
+        self.phase = TickerPhase::Armed;
+        self.outstanding += 1;
         Some(Duration::ZERO)
     }
 
-    pub fn on_timer(&mut self, now: Instant) -> TimerAction {
+    /// Record a `set_timeout` armed by something other than the ticker itself
+    /// (probe retry, publication retry). Keeping one counter for every timer
+    /// this plugin arms is what makes the outstanding count trustworthy.
+    pub fn note_schedule(&mut self) {
+        self.outstanding += 1;
+    }
+
+    pub fn on_timer(&mut self) -> TimerAction {
+        self.outstanding = self.outstanding.saturating_sub(1);
         match self.phase {
-            TickerPhase::TimerArmed(due) if now >= due => {
+            TickerPhase::Armed => {
                 self.phase = TickerPhase::CyclePending;
                 TimerAction::RunCycle
             }
@@ -61,25 +89,47 @@ impl SampleTicker {
         }
     }
 
-    pub fn on_cycle_completed(&mut self, now: Instant) -> Duration {
+    pub fn on_cycle_completed(&mut self) -> Option<Duration> {
         assert!(
             matches!(self.phase, TickerPhase::CyclePending),
             "no cycle is pending"
         );
-        let delay = self.interval;
-        self.arm(now, delay);
-        delay
+        self.phase = TickerPhase::Armed;
+        self.rearm_if_uncovered()
     }
 
-    fn arm(&mut self, now: Instant, delay: Duration) {
-        self.phase = TickerPhase::TimerArmed(now + delay);
+    /// Restore the invariant after a timer that ran no cycle. Without this a
+    /// stray event could consume the last outstanding timer and strand an
+    /// armed ticker with nothing left to wake it.
+    pub fn ensure_armed(&mut self) -> Option<Duration> {
+        match self.phase {
+            TickerPhase::Idle | TickerPhase::CyclePending => None,
+            TickerPhase::Armed => self.rearm_if_uncovered(),
+        }
+    }
+
+    fn rearm_if_uncovered(&mut self) -> Option<Duration> {
+        if self.outstanding > 0 {
+            return None;
+        }
+        self.outstanding += 1;
+        Some(self.interval)
+    }
+
+    #[cfg(test)]
+    fn is_deadlocked(&self) -> bool {
+        !matches!(self.phase, TickerPhase::Idle) && self.outstanding == 0
     }
 }
 
+/// Retry gate for publisher initialization. Clock-free for the same reason as
+/// [`SampleTicker`]: a timer event is the timer we armed coming due, so there
+/// is nothing a deadline comparison can add, and a stale `Instant` would only
+/// strand the retry.
 #[derive(Debug)]
 pub struct RetryTimer {
     interval: Duration,
-    deadline: Option<Instant>,
+    armed: bool,
 }
 
 impl RetryTimer {
@@ -87,23 +137,18 @@ impl RetryTimer {
         assert!(!interval.is_zero(), "retry interval must be non-zero");
         Self {
             interval,
-            deadline: None,
+            armed: false,
         }
     }
 
-    pub fn arm(&mut self, now: Instant) -> Duration {
-        self.deadline = Some(now + self.interval);
+    pub fn arm(&mut self) -> Duration {
+        self.armed = true;
         self.interval
     }
 
-    pub fn on_timer(&mut self, now: Instant) -> bool {
-        match self.deadline {
-            Some(deadline) if now >= deadline => {
-                self.deadline = None;
-                true
-            }
-            _ => false,
-        }
+    /// True once per arming: a duplicate or unsolicited event answers false.
+    pub fn on_timer(&mut self) -> bool {
+        std::mem::replace(&mut self.armed, false)
     }
 }
 
@@ -191,10 +236,12 @@ where
     }
 
     pub fn on_timer(&mut self) -> BroadcasterAction {
+        let now = self.clock.now();
+        self.clamp_to_epoch(now);
         let Some(deadline) = self.timer_deadline else {
             return BroadcasterAction::None;
         };
-        if self.clock.now() < deadline {
+        if now < deadline {
             return BroadcasterAction::None;
         }
         self.timer_deadline = None;
@@ -215,12 +262,44 @@ where
         &self.sink
     }
 
+    /// Pull deadlines back into reach of the current clock epoch.
+    ///
+    /// `change_host_folder` rebuilds the WASI context and restarts
+    /// CLOCK_MONOTONIC at zero, so deadlines taken before the swap sit up to a
+    /// whole epoch ahead of every later reading. `Instant` still advances, so
+    /// this is throttling drift rather than the ticker's deadlock, but left
+    /// alone it delays the first publication by that stale offset.
+    ///
+    /// Nothing here may be scheduled further out than one interval, so a
+    /// deadline beyond that horizon cannot be a real one.
+    fn clamp_to_epoch(&mut self, now: Instant) {
+        let horizon = now + self.interval;
+        if self.startup_not_before > horizon {
+            self.startup_not_before = horizon;
+        }
+        for deadline in [
+            &mut self.external_not_before,
+            &mut self.sink_retry_not_before,
+            &mut self.timer_deadline,
+        ] {
+            if deadline.is_some_and(|value| value > horizon) {
+                *deadline = Some(horizon);
+            }
+        }
+        // last_completed is a past instant, not a deadline: a reset epoch makes
+        // it look future-dated, which would suppress the next publication.
+        if self.last_completed.is_some_and(|value| value > now) {
+            self.last_completed = Some(now);
+        }
+    }
+
     fn flush_or_schedule(&mut self) -> BroadcasterAction {
         if self.pending.is_none() {
             return BroadcasterAction::None;
         }
 
         let now = self.clock.now();
+        self.clamp_to_epoch(now);
         let due = self.next_due();
         if now < due {
             if self.timer_deadline == Some(due) {
@@ -902,46 +981,158 @@ mod tests {
 
     #[test]
     fn duplicate_timer_events_do_not_fork_the_tick_loop() {
-        let now = Instant::now();
         let mut ticker = ticker();
 
-        assert_eq!(ticker.start(now), Some(Duration::ZERO));
-        assert_eq!(ticker.on_timer(now), TimerAction::RunCycle);
-        assert_eq!(ticker.on_timer(now), TimerAction::Ignore);
-        assert_eq!(ticker.on_cycle_completed(now), TICK);
-        assert_eq!(
-            ticker.on_timer(now + Duration::from_secs(1)),
-            TimerAction::Ignore
-        );
-        assert_eq!(ticker.on_timer(now + TICK), TimerAction::RunCycle);
+        assert_eq!(ticker.start(), Some(Duration::ZERO));
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
+        // Second event lands mid-cycle: no nested cycle, and the completion
+        // below still owes a replacement timer.
+        assert_eq!(ticker.on_timer(), TimerAction::Ignore);
+        assert_eq!(ticker.on_cycle_completed(), Some(TICK));
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
     }
 
     #[test]
-    fn retry_timer_ignores_early_and_duplicate_events() {
-        let now = Instant::now();
+    fn retry_timer_fires_once_per_arming() {
         let mut retry = RetryTimer::new(TICK);
 
-        assert_eq!(retry.arm(now), TICK);
-        assert!(!retry.on_timer(now + Duration::from_secs(1)));
-        assert!(retry.on_timer(now + TICK));
-        assert!(!retry.on_timer(now + TICK));
+        assert!(!retry.on_timer(), "unsolicited event must not fire");
+        assert_eq!(retry.arm(), TICK);
+        assert!(retry.on_timer());
+        assert!(!retry.on_timer(), "duplicate event must not fire");
 
-        assert_eq!(retry.arm(now + TICK), TICK);
-        assert!(!retry.on_timer(now + Duration::from_secs(3)));
-        assert!(retry.on_timer(now + TICK + TICK));
+        assert_eq!(retry.arm(), TICK);
+        assert!(retry.on_timer());
     }
 
     #[test]
-    fn ticker_anchors_next_cycle_after_current_work() {
-        let now = Instant::now();
+    fn completed_cycle_asks_for_a_full_interval() {
         let mut ticker = ticker();
 
-        ticker.start(now);
-        assert_eq!(ticker.on_timer(now), TimerAction::RunCycle);
-        let completed = now + Duration::from_millis(400);
-        assert_eq!(ticker.on_cycle_completed(completed), TICK);
-        assert_eq!(ticker.on_timer(now + TICK), TimerAction::Ignore);
-        assert_eq!(ticker.on_timer(completed + TICK), TimerAction::RunCycle);
+        ticker.start();
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
+        // The next deadline starts when the work finished, so however long the
+        // cycle took cannot eat into the following interval.
+        assert_eq!(ticker.on_cycle_completed(), Some(TICK));
+    }
+
+    #[test]
+    fn concurrent_schedules_collapse_into_one_cycle() {
+        let mut ticker = ticker();
+
+        ticker.start();
+        // Publication retry and probe retry each arm their own timer.
+        ticker.note_schedule();
+        ticker.note_schedule();
+
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
+        assert_eq!(
+            ticker.on_cycle_completed(),
+            None,
+            "two timers are still outstanding; arming a third would compound"
+        );
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
+        assert_eq!(ticker.on_cycle_completed(), None);
+        assert_eq!(ticker.on_timer(), TimerAction::RunCycle);
+        assert_eq!(
+            ticker.on_cycle_completed(),
+            Some(TICK),
+            "last outstanding timer consumed, so the loop must re-arm"
+        );
+    }
+
+    /// The 2026-08-10 deadlock: `change_host_folder` rebuilds the WASI context
+    /// and restarts CLOCK_MONOTONIC, the deadline comparison answered Ignore
+    /// forever, and the Ignore path armed no replacement. `set_timeout` is
+    /// one-shot, so the plugin went silent for the whole session.
+    ///
+    /// The ticker reads no clock now, so the epoch reset is unrepresentable
+    /// here; what this pins down is the property that made it fatal.
+    #[test]
+    fn ticker_never_strands_itself_without_a_pending_timer() {
+        let mut idle = ticker();
+        assert!(!idle.is_deadlocked());
+        idle.start();
+        assert!(!idle.is_deadlocked());
+
+        // Every reachable interleaving of the three inputs, to a depth that
+        // covers each phase transition more than once.
+        for step in 0..3usize.pow(6) {
+            let mut ticker = ticker();
+            ticker.start();
+            let mut code = step;
+            for _ in 0..6 {
+                match code % 3 {
+                    0 => {
+                        if ticker.on_timer() == TimerAction::RunCycle {
+                            if let Some(delay) = ticker.on_cycle_completed() {
+                                assert_eq!(delay, TICK);
+                            }
+                        } else if let Some(delay) = ticker.ensure_armed() {
+                            assert_eq!(delay, TICK);
+                        }
+                    }
+                    1 => ticker.note_schedule(),
+                    _ => {
+                        if let Some(delay) = ticker.ensure_armed() {
+                            assert_eq!(delay, TICK);
+                        }
+                    }
+                }
+                code /= 3;
+                assert!(
+                    !ticker.is_deadlocked(),
+                    "armed with no outstanding timer at step {step}: {ticker:?}"
+                );
+            }
+        }
+    }
+
+    /// `SessionBroadcaster::new` runs inside `load()`, before
+    /// `change_host_folder` rebuilds the WASI context and restarts
+    /// CLOCK_MONOTONIC. `startup_not_before` is therefore stamped in an epoch
+    /// that every later reading predates. `Instant` still advances, so this
+    /// delays rather than deadlocks -- but the delay is the stale offset,
+    /// which is unbounded from the broadcaster's point of view.
+    #[test]
+    fn publication_survives_a_clock_epoch_reset() {
+        let started = Instant::now() + Duration::from_secs(3600);
+        let (clock, mut broadcaster) = broadcaster(started, Duration::ZERO);
+
+        // The WASI context is replaced: the monotonic clock restarts near zero.
+        let epoch_reset = Instant::now();
+        clock.set(epoch_reset);
+
+        assert_eq!(
+            broadcaster.submit(values("first")),
+            BroadcasterAction::Schedule(TICK),
+            "a deadline an hour ahead must be pulled back to one interval"
+        );
+        clock.set(epoch_reset + TICK);
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+        assert_eq!(broadcaster.sink().completed, 1);
+    }
+
+    /// A past instant read through a restarted clock looks future-dated, which
+    /// would suppress every later publication.
+    #[test]
+    fn epoch_reset_does_not_future_date_the_last_publication() {
+        let started = Instant::now();
+        let (clock, mut broadcaster) = broadcaster(started, Duration::ZERO);
+
+        clock.set(started + TICK);
+        assert_eq!(broadcaster.submit(values("first")), BroadcasterAction::Published);
+
+        // last_completed now sits in the old epoch, ahead of the new clock.
+        let epoch_reset = started - Duration::from_secs(3600);
+        clock.set(epoch_reset);
+        assert_eq!(
+            broadcaster.submit(values("second")),
+            BroadcasterAction::Schedule(TICK)
+        );
+        clock.set(epoch_reset + TICK);
+        assert_eq!(broadcaster.on_timer(), BroadcasterAction::Published);
+        assert_eq!(broadcaster.sink().completed, 2);
     }
 
     #[test]

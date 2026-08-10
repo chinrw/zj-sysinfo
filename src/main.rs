@@ -170,7 +170,7 @@ impl ActivePlugin {
                 let PublisherState::Initializing { retry, .. } = &mut self.publisher else {
                     unreachable!("publisher changed while initializing");
                 };
-                schedule_timer(retry.arm(Instant::now()));
+                schedule_timer(retry.arm());
             }
         }
     }
@@ -196,7 +196,7 @@ impl ActivePlugin {
             }
             timer_event @ Event::Timer(_) => {
                 let should_initialize = match &mut self.publisher {
-                    PublisherState::Initializing { retry, .. } => retry.on_timer(Instant::now()),
+                    PublisherState::Initializing { retry, .. } => retry.on_timer(),
                     PublisherState::Running(runtime) => {
                         runtime.update(timer_event);
                         false
@@ -228,20 +228,33 @@ impl Runtime {
         }
         self.granted = true;
         change_host_folder(PathBuf::from("/"));
-        if let Some(delay) = self.ticker.start(Instant::now()) {
-            schedule_timer(delay);
+        if let Some(delay) = self.ticker.start() {
+            self.schedule(delay);
         }
+    }
+
+    /// Single accounted entry point for `set_timeout`. Every timer this plugin
+    /// arms has to pass through here, otherwise the ticker's outstanding count
+    /// drifts and its no-deadlock invariant stops meaning anything.
+    fn schedule(&mut self, delay: Duration) {
+        self.ticker.note_schedule();
+        schedule_timer(delay);
     }
 
     fn update(&mut self, event: Event) {
         match event {
             Event::Timer(_) if self.granted => {
+                let action = self.ticker.on_timer();
                 let broadcast_action = self.broadcaster.on_timer();
                 self.handle_broadcaster_action(broadcast_action);
-                if self.ticker.on_timer(Instant::now()) == TimerAction::RunCycle {
+                let rearm = if action == TimerAction::RunCycle {
                     self.tick();
-                    let delay = self.ticker.on_cycle_completed(Instant::now());
-                    schedule_timer(delay);
+                    self.ticker.on_cycle_completed()
+                } else {
+                    self.ticker.ensure_armed()
+                };
+                if let Some(delay) = rearm {
+                    self.schedule(delay);
                 }
             }
             Event::RunCommandResult(_, stdout, _, context)
@@ -307,12 +320,21 @@ impl Runtime {
         // if there were no previous sample at all.
         let text = match &self.prev {
             Some((prev_iface, at, prev_rx, prev_tx)) if *prev_iface == iface => {
-                let elapsed = now.duration_since(*at).as_secs_f64();
-                format!(
-                    "D: {} U: {}",
-                    format_speed(rate(*prev_rx, rx, elapsed)),
-                    format_speed(rate(*prev_tx, tx, elapsed)),
-                )
+                // checked_ rather than saturating: a rebuilt WASI context
+                // restarts CLOCK_MONOTONIC, so `now` can predate the previous
+                // sample. A saturating zero would feed rate() an empty window
+                // and report a confident "0 B/s" for an unknown speed.
+                match now.checked_duration_since(*at) {
+                    Some(elapsed) if !elapsed.is_zero() => {
+                        let elapsed = elapsed.as_secs_f64();
+                        format!(
+                            "D: {} U: {}",
+                            format_speed(rate(*prev_rx, rx, elapsed)),
+                            format_speed(rate(*prev_tx, tx, elapsed)),
+                        )
+                    }
+                    _ => "-".to_string(),
+                }
             }
             _ => "-".to_string(),
         };
@@ -361,9 +383,9 @@ impl Runtime {
         self.handle_broadcaster_action(action);
     }
 
-    fn handle_broadcaster_action(&self, action: BroadcasterAction) {
+    fn handle_broadcaster_action(&mut self, action: BroadcasterAction) {
         if let BroadcasterAction::Schedule(delay) = action {
-            schedule_timer(delay);
+            self.schedule(delay);
         }
     }
 }

@@ -45,6 +45,43 @@ clock value. If that source is temporarily unavailable, the active copy keeps
 its permissions and timer subscriptions and retries initialization. It does not
 derive identity from resettable cache state.
 
+## Cadence correction (2026-08-10)
+
+`change_host_folder` does not reload the plugin: zellij replaces the WASI
+context in place (`wasm_bridge.rs`, `std::mem::replace` on
+`plugin_env.wasi_ctx`). The replacement restarts CLOCK_MONOTONIC, so
+`Instant::now()` jumps backwards -- measured at ~27ms in a real session -- and
+every deadline stamped before the swap sits permanently in the future.
+
+That was fatal because three things lined up: `set_timeout` is one-shot, the
+deadline comparison answered `Ignore` forever, and the `Ignore` path armed no
+replacement. One timer event in, total silence after, no self-healing path.
+Both the deployed revision and the tip failed this way for entire sessions.
+
+`SampleTicker` and `RetryTimer` therefore read no clock at all. A timer event
+is by definition one of ours coming due, so it needs no corroboration. Every
+`set_timeout` is counted instead, and a replacement is armed only when no other
+timer is outstanding, which is what collapses the redundant schedules the
+probe-retry and publication-retry paths can produce. The invariant that
+replaces the deadline check: a non-idle ticker always has at least one
+outstanding timer.
+
+`SessionBroadcaster` still needs a clock -- it throttles publication rate, not
+event delivery -- so it clamps deadlines into the current epoch instead.
+Nothing it schedules may sit further out than one interval, so anything beyond
+that horizon cannot be a live deadline. Without the clamp an epoch reset only
+delays publication rather than deadlocking it, because `Instant` keeps
+advancing, but the delay is the stale offset and is unbounded from the
+broadcaster's point of view.
+
+Netspeed uses `checked_duration_since`: after a reset the previous sample can
+postdate the current one, and a saturating zero would make `rate()` report a
+confident `0 B/s` for an unknown speed.
+
+None of this is reachable from unit tests -- it lives in zellij's runtime
+behavior -- so `scripts/e2e.sh` drives a real session and reads the rendered
+bar. It fails against every pre-fix build, with both widgets blank.
+
 ## Problem
 
 The zjstatus status bar shows net speed and load averages via `command_*`
