@@ -160,7 +160,22 @@ if [ -z "$found" ]; then
   printf 'e2e: no live sample within %ss\n' "$DEADLINE_SECS" >&2
   printf 'e2e: last rendered: %s\n' "${last:-<nothing>}" >&2
   printf 'e2e: an empty widget means the plugin published nothing at all;\n' >&2
-  printf 'e2e: "-" means it published but had no comparable sample.\n' >&2
+  printf 'e2e: "-" means it published but had no comparable sample;\n' >&2
+  printf 'e2e: nothing at all means the bar never rendered (plugin load or\n' >&2
+  printf 'e2e: permission failure, which looks identical from the outside).\n' >&2
+  # Without these a CI failure is undiagnosable: the screen capture alone
+  # cannot distinguish a silent plugin from a session that never started.
+  log="$WORK/zellij-$(id -u)/zellij-log/zellij.log"
+  if [ -f "$log" ]; then
+    printf '\ne2e: --- zellij.log (plugin lines) ---\n' >&2
+    grep -iE 'plugin|permission|error|panic' "$log" | tail -30 >&2
+  else
+    printf '\ne2e: no zellij log at %s -- the session never started\n' "$log" >&2
+  fi
+  printf '\ne2e: --- captured screen (last 400 bytes, escapes stripped) ---\n' >&2
+  sed -e 's/\x1b\[[0-9;?]*[ -/]*[@-~]//g' -e 's/\x1b\][^\x07\x1b]*\(\x07\|\x1b\\\)//g' \
+      "$WORK/screen.raw" 2>/dev/null | tr -d '\r' | tail -c 400 >&2
+  printf '\n' >&2
   exit 1
 fi
 
