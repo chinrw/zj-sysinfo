@@ -9,9 +9,8 @@ use zj_sysinfo::{
     default_iface, fallback_iface, format_speed, iface_bytes, instance_nonce_from_random,
     is_active_client, loadavg, parse_macos_probe, probe_context, probe_token_from_context,
     publication_completion_nonce, rate, sample_window, AsyncProbe, BroadcasterAction, ProbeAction,
-    ProbeToken,
-    RetryTimer, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction, SystemClock,
-    TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
+    ProbeToken, RetryTimer, SampleTicker, SessionBroadcaster, SharedPublicationLease, SinkAction,
+    SystemClock, TimerAction, WidgetSink, WidgetValues, PUBLICATION_COMPLETE_MESSAGE,
 };
 
 const INTERVAL: Duration = Duration::from_secs(2);
